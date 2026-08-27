@@ -22,14 +22,16 @@ export async function getJob(jobId) {
   return res.json()
 }
 
-const STEP_LABELS = {
-  uploading: 'Uploading files…',
-  running_ocr: 'Reading pages with OCR…',
-  extracting_questions: 'Extracting questions from paper…',
-  mapping_answers: 'Reading handwriting & mapping answers…',
-  grading: 'Grading answers…',
-  complete: 'Done',
-}
+export const PROCESSING_STEPS = [
+  { key: 'uploading', label: 'Uploading files' },
+  { key: 'running_ocr', label: 'Reading pages with OCR' },
+  { key: 'extracting_questions', label: 'Extracting questions from paper' },
+  { key: 'mapping_answers', label: 'Reading handwriting & mapping answers' },
+  { key: 'grading', label: 'Grading answers' },
+  { key: 'complete', label: 'Done' },
+]
+
+const STEP_LABELS = Object.fromEntries(PROCESSING_STEPS.map((s) => [s.key, s.label]))
 
 export function stepLabel(step) {
   return STEP_LABELS[step] || 'Processing…'

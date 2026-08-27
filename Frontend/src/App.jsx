@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { Lottie } from 'lottie-react'
 import './App.css'
 import MappingView from './MappingView.jsx'
-import { uploadFiles, pollJob, stepLabel } from './api.js'
+import { uploadFiles, pollJob, PROCESSING_STEPS } from './api.js'
 
 const NAV_ITEMS = [
   { key: 'home', label: 'Home', icon: 'grid' },
@@ -107,6 +107,44 @@ function UploadCard({ label, highlight, hint, file, onFileSelect }) {
       </p>
       <p className="upload-hint">{file ? file.name : hint}</p>
     </div>
+  )
+}
+
+function StepChecklist({ currentStep }) {
+  const currentIndex = PROCESSING_STEPS.findIndex((s) => s.key === currentStep)
+
+  return (
+    <ul className="step-checklist">
+      {PROCESSING_STEPS.map((step, index) => {
+        const state =
+          currentIndex === -1
+            ? index === 0
+              ? 'active'
+              : 'pending'
+            : index < currentIndex
+              ? 'done'
+              : index === currentIndex
+                ? 'active'
+                : 'pending'
+
+        return (
+          <li key={step.key} className={`step-item step-${state}`}>
+            <span className="step-icon" aria-hidden="true">
+              {state === 'done' ? (
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                  <path d="M3 8.5 6.5 12 13 4.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              ) : state === 'active' ? (
+                <span className="step-spinner" />
+              ) : (
+                <span className="step-dot" />
+              )}
+            </span>
+            <span className="step-label">{step.label}</span>
+          </li>
+        )
+      })}
+    </ul>
   )
 }
 
@@ -267,14 +305,11 @@ function App() {
 
                   <div className="mascot" aria-hidden="true">
                     <span className="mascot-ring">
-                      <Lottie src="/Teaching.json" autoplay loop className="mascot-lottie" />
+                      <Lottie src="/generating.json" autoplay loop className="mascot-lottie" />
                     </span>
                   </div>
 
-                  <div className="processing-status">
-                    <div className="spinner" aria-hidden="true" />
-                    <span>{stepLabel(processingStep)}</span>
-                  </div>
+                  <StepChecklist currentStep={processingStep} />
                 </>
               ) : (
                 <>
