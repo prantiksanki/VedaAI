@@ -1,0 +1,3 @@
+{
+  "ignore": ["debug/*", "node_modules/*"]
+}
