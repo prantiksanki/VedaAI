@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { Lottie } from 'lottie-react'
 import './App.css'
 import MappingView from './MappingView.jsx'
-import { uploadFiles, pollJob, stepLabel } from './api.js'
+import { uploadFiles, pollJob, PROCESSING_STEPS } from './api.js'
 
 const NAV_ITEMS = [
   { key: 'home', label: 'Home', icon: 'grid' },
@@ -106,6 +106,24 @@ function UploadCard({ label, highlight, hint, file, onFileSelect }) {
         Upload <span className="highlight">{highlight}</span>
       </p>
       <p className="upload-hint">{file ? file.name : hint}</p>
+    </div>
+  )
+}
+
+function LiveStatus({ currentStep }) {
+  const index = PROCESSING_STEPS.findIndex((s) => s.key === currentStep)
+  const step = index === -1 ? PROCESSING_STEPS[0] : PROCESSING_STEPS[index]
+  const progressPercent = index === -1 ? 0 : ((index + 1) / PROCESSING_STEPS.length) * 100
+
+  return (
+    <div className="live-status">
+      <div className="live-status-line">
+        <span className="live-status-spinner" aria-hidden="true" />
+        <span className="live-status-label">{step.label}&hellip;</span>
+      </div>
+      <div className="live-status-track" role="progressbar" aria-valuenow={Math.round(progressPercent)} aria-valuemin={0} aria-valuemax={100}>
+        <div className="live-status-fill" style={{ width: `${progressPercent}%` }} />
+      </div>
     </div>
   )
 }
@@ -267,14 +285,11 @@ function App() {
 
                   <div className="mascot" aria-hidden="true">
                     <span className="mascot-ring">
-                      <Lottie src="/Teaching.json" autoplay loop className="mascot-lottie" />
+                      <Lottie src="/generating.json" autoplay loop className="mascot-lottie" />
                     </span>
                   </div>
 
-                  <div className="processing-status">
-                    <div className="spinner" aria-hidden="true" />
-                    <span>{stepLabel(processingStep)}</span>
-                  </div>
+                  <LiveStatus currentStep={processingStep} />
                 </>
               ) : (
                 <>

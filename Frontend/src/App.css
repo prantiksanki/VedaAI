@@ -444,25 +444,51 @@
   font-size: 13.5px;
 }
 
-/* Processing state */
-.processing-status {
+/* Processing state - single live status, not a step list */
+.live-status {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  font-size: 14.5px;
-  color: var(--text-h);
-  font-weight: 600;
+  gap: 14px;
   margin-top: 8px;
 }
 
-.spinner {
+.live-status-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.live-status-label {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+.live-status-spinner {
   width: 18px;
   height: 18px;
   border-radius: 50%;
   border: 2.5px solid #ece9f1;
   border-top-color: #aa3bff;
   animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.live-status-track {
+  width: 260px;
+  max-width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: #ece9f1;
+  overflow: hidden;
+}
+
+.live-status-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #aa3bff, #ff7a3d);
+  transition: width 0.4s ease;
 }
 
 @keyframes spin {
