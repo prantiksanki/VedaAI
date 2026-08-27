@@ -110,41 +110,21 @@ function UploadCard({ label, highlight, hint, file, onFileSelect }) {
   )
 }
 
-function StepChecklist({ currentStep }) {
-  const currentIndex = PROCESSING_STEPS.findIndex((s) => s.key === currentStep)
+function LiveStatus({ currentStep }) {
+  const index = PROCESSING_STEPS.findIndex((s) => s.key === currentStep)
+  const step = index === -1 ? PROCESSING_STEPS[0] : PROCESSING_STEPS[index]
+  const progressPercent = index === -1 ? 0 : ((index + 1) / PROCESSING_STEPS.length) * 100
 
   return (
-    <ul className="step-checklist">
-      {PROCESSING_STEPS.map((step, index) => {
-        const state =
-          currentIndex === -1
-            ? index === 0
-              ? 'active'
-              : 'pending'
-            : index < currentIndex
-              ? 'done'
-              : index === currentIndex
-                ? 'active'
-                : 'pending'
-
-        return (
-          <li key={step.key} className={`step-item step-${state}`}>
-            <span className="step-icon" aria-hidden="true">
-              {state === 'done' ? (
-                <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-                  <path d="M3 8.5 6.5 12 13 4.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              ) : state === 'active' ? (
-                <span className="step-spinner" />
-              ) : (
-                <span className="step-dot" />
-              )}
-            </span>
-            <span className="step-label">{step.label}</span>
-          </li>
-        )
-      })}
-    </ul>
+    <div className="live-status">
+      <div className="live-status-line">
+        <span className="live-status-spinner" aria-hidden="true" />
+        <span className="live-status-label">{step.label}&hellip;</span>
+      </div>
+      <div className="live-status-track" role="progressbar" aria-valuenow={Math.round(progressPercent)} aria-valuemin={0} aria-valuemax={100}>
+        <div className="live-status-fill" style={{ width: `${progressPercent}%` }} />
+      </div>
+    </div>
   )
 }
 
@@ -309,7 +289,7 @@ function App() {
                     </span>
                   </div>
 
-                  <StepChecklist currentStep={processingStep} />
+                  <LiveStatus currentStep={processingStep} />
                 </>
               ) : (
                 <>
