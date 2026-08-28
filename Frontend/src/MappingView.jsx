@@ -1,4 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
+import { requestPlagiarismReport } from './api.js'
+
+const MIN_PLAGIARISM_CHARS = 300
 
 const STATUS_META = {
   answered: { label: 'Answered', className: 'status-answered' },
@@ -241,6 +244,8 @@ function McqReview({ question }) {
 
 export default function MappingView({ result, onReset }) {
   const [selectedQuestionId, setSelectedQuestionId] = useState(result.questions[0]?.id ?? null)
+  const [reportStatus, setReportStatus] = useState('idle') // 'idle' | 'loading' | 'error'
+  const [reportError, setReportError] = useState(null)
 
   const selectedQuestion = result.questions.find((q) => q.id === selectedQuestionId) ?? null
 
@@ -248,8 +253,31 @@ export default function MappingView({ result, onReset }) {
 
   const answeredCount = result.questions.filter((q) => q.status === 'answered').length
 
+  const questionPaperText = result.questionPaperText ?? ''
+  const canCheckPlagiarism = questionPaperText.trim().length >= MIN_PLAGIARISM_CHARS
+
   function selectQuestion(id) {
     setSelectedQuestionId(id)
+  }
+
+  async function handlePlagiarismCheck() {
+    setReportStatus('loading')
+    setReportError(null)
+    try {
+      const blob = await requestPlagiarismReport(questionPaperText)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'ai-content-detection-report.pdf'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      setReportStatus('idle')
+    } catch (err) {
+      setReportError(err.message)
+      setReportStatus('error')
+    }
   }
 
   return (
@@ -261,9 +289,27 @@ export default function MappingView({ result, onReset }) {
             {answeredCount} of {result.questions.length} questions answered
           </p>
         </div>
-        <button type="button" className="reset-btn" onClick={onReset}>
-          Upload New Files
-        </button>
+        <div className="mapping-header-actions">
+          <div className="plagiarism-action">
+            <button
+              type="button"
+              className="plagiarism-btn"
+              onClick={handlePlagiarismCheck}
+              disabled={!canCheckPlagiarism || reportStatus === 'loading'}
+            >
+              {reportStatus === 'loading' ? 'Generating report…' : 'AI Plagiarism Checker'}
+            </button>
+            {!canCheckPlagiarism && (
+              <span className="plagiarism-hint">Not enough question-paper text to analyze</span>
+            )}
+            {reportStatus === 'error' && reportError && (
+              <span className="plagiarism-error">{reportError}</span>
+            )}
+          </div>
+          <button type="button" className="reset-btn" onClick={onReset}>
+            Upload New Files
+          </button>
+        </div>
       </div>
 
       {result.overallFeedback && (
