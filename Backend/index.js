@@ -96,6 +96,7 @@ async function processJob(jobId, questionPaperFile, answerSheetFile) {
     const mapping = mappings.find((m) => m.questionId === q.id) ?? {
       status: 'unanswered',
       answerText: null,
+      selectedOption: null,
       regions: [],
     }
     const grade = gradeById.get(q.id) ?? null

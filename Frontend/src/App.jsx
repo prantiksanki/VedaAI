@@ -132,9 +132,10 @@ function App() {
   const [activeNav, setActiveNav] = useState('exams')
   const [questionPaper, setQuestionPaper] = useState(null)
   const [answerSheet, setAnswerSheet] = useState(null)
-  const [stage, setStage] = useState('upload') // 'upload' | 'processing' | 'results'
+  const isMock = new URLSearchParams(window.location.search).has('mock')
+  const [stage, setStage] = useState(isMock ? 'results' : 'upload') // 'upload' | 'processing' | 'results'
   const [processingStep, setProcessingStep] = useState(null)
-  const [result, setResult] = useState(null)
+  const [result, setResult] = useState(isMock ? window.__MOCK_RESULT__ : null)
   const [error, setError] = useState(null)
 
   const canStartMapping = Boolean(questionPaper && answerSheet)
