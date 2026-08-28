@@ -8,13 +8,15 @@ import { ocrFile } from './lib/ocrClient.js'
 import { extractQuestions } from './lib/extractQuestions.js'
 import { extractAndMapAnswers } from './lib/extractAnswers.js'
 import { gradeAnswers } from './lib/gradeAnswers.js'
+import { detectAiContent } from './lib/winstonClient.js'
+import { buildAiDetectionReportPdf } from './lib/plagiarismReport.js'
 import { createJob, getJob, updateJob } from './lib/store.js'
 
 const app = express()
 const PORT = process.env.PORT || 4000
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || '*' }))
-app.use(express.json())
+app.use(express.json({ limit: '5mb' }))
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024 // 25MB - scanned PDFs/photos routinely exceed 10MB
 
@@ -67,6 +69,34 @@ app.get('/api/jobs/:id', (req, res) => {
   res.json(job)
 })
 
+// Runs Winston AI content detection on the teacher's question-paper text and
+// streams back a downloadable PDF report.
+app.post('/api/plagiarism-report', async (req, res, next) => {
+  try {
+    const { text } = req.body ?? {}
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ error: 'text is required' })
+    }
+
+    const trimmed = text.trim()
+    if (trimmed.length < 300) {
+      return res.status(400).json({
+        error: 'Not enough text to analyze. Winston AI needs at least 300 characters.',
+      })
+    }
+
+    const winston = await detectAiContent(trimmed.slice(0, 150000))
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', 'attachment; filename="ai-content-detection-report.pdf"')
+
+    const wordCount = trimmed.split(/\s+/).filter(Boolean).length
+    buildAiDetectionReportPdf(winston, { wordCount }).pipe(res)
+  } catch (err) {
+    next(err)
+  }
+})
+
 async function processJob(jobId, questionPaperFile, answerSheetFile) {
   updateJob(jobId, { step: 'running_ocr' })
   const [questionOcrPages, answerOcrPages] = await Promise.all([
@@ -91,6 +121,13 @@ async function processJob(jobId, questionPaperFile, answerSheetFile) {
   const answerPageMeta = answerOcrPages.map((p) => ({ page: p.page, width: p.width, height: p.height, dataUrl: p.dataUrl }))
   const gradeById = new Map((grading?.grades ?? []).map((g) => [g.questionId, g]))
 
+  // Concatenated printed text of the question paper, kept so the results screen
+  // can run the AI content-detection check without re-OCRing the file.
+  const questionPaperText = questionOcrPages
+    .flatMap((p) => p.lines.map((l) => l.text))
+    .join(' ')
+    .trim()
+
   const questionResults = questions.map((q) => {
     const { regions: questionPaperRegions, ...questionRest } = q
     const mapping = mappings.find((m) => m.questionId === q.id) ?? {
@@ -112,6 +149,7 @@ async function processJob(jobId, questionPaperFile, answerSheetFile) {
       questions: questionResults,
       answerPages: answerPageMeta,
       overallFeedback: grading?.overallFeedback ?? null,
+      questionPaperText,
     },
   })
 }
