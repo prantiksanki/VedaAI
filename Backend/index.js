@@ -4,17 +4,20 @@ import cors from 'cors'
 import multer from 'multer'
 import { v4 as uuid } from 'uuid'
 
-import { ocrFile } from './lib/ocrClient.js'
+import { rasterize } from './lib/rasterize.js'
 import { extractQuestions } from './lib/extractQuestions.js'
 import { extractAndMapAnswers } from './lib/extractAnswers.js'
 import { gradeAnswers } from './lib/gradeAnswers.js'
+import { buildCheckedCopyPdf } from './lib/checkedCopyReport.js'
 import { createJob, getJob, updateJob } from './lib/store.js'
 
 const app = express()
 const PORT = process.env.PORT || 4000
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || '*' }))
-app.use(express.json())
+// Limit is generous: the checked-copy endpoint receives the graded result including
+// base64 answer-sheet page images (answer-sheet upload cap is 25MB; base64 inflates ~33%).
+app.use(express.json({ limit: '30mb' }))
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024 // 25MB - scanned PDFs/photos routinely exceed 10MB
 
@@ -67,51 +70,97 @@ app.get('/api/jobs/:id', (req, res) => {
   res.json(job)
 })
 
+// Builds a downloadable "checked copy" PDF (grading summary + annotated answer-sheet
+// pages) from the graded result the frontend already holds.
+app.post('/api/checked-copy', async (req, res, next) => {
+  try {
+    const { result } = req.body ?? {}
+    if (!result || !Array.isArray(result.questions) || !Array.isArray(result.answerPages)) {
+      return res.status(400).json({ error: 'A graded result is required.' })
+    }
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', 'attachment; filename="checked-copy.pdf"')
+
+    buildCheckedCopyPdf(result).pipe(res)
+  } catch (err) {
+    next(err)
+  }
+})
+
+// Wrap a pipeline stage so a failure is recorded on the job with the stage name,
+// instead of surfacing as a generic 500.
+async function stage(jobId, step, fn) {
+  updateJob(jobId, { step })
+  try {
+    return await fn()
+  } catch (err) {
+    const message = `${step}: ${err.message}`
+    console.error(`Job ${jobId} ${message}`)
+    updateJob(jobId, { status: 'error', error: message, failedStep: step })
+    throw err
+  }
+}
+
 async function processJob(jobId, questionPaperFile, answerSheetFile) {
-  updateJob(jobId, { step: 'running_ocr' })
-  const [questionOcrPages, answerOcrPages] = await Promise.all([
-    ocrFile(questionPaperFile, 'printed'),
-    ocrFile(answerSheetFile, 'handwritten'),
-  ])
+  const [questionPaperPages, answerPages] = await stage(jobId, 'rasterizing', () =>
+    Promise.all([
+      rasterize({
+        buffer: questionPaperFile.buffer,
+        mimetype: questionPaperFile.mimetype,
+        originalname: questionPaperFile.originalname,
+      }),
+      rasterize({
+        buffer: answerSheetFile.buffer,
+        mimetype: answerSheetFile.mimetype,
+        originalname: answerSheetFile.originalname,
+      }),
+    ]),
+  )
 
-  updateJob(jobId, { step: 'extracting_questions' })
-  const questions = await extractQuestions(questionOcrPages)
+  const questions = await stage(jobId, 'extracting_questions', () => extractQuestions(questionPaperPages))
 
-  updateJob(jobId, { step: 'mapping_answers' })
-  const { mappings } = await extractAndMapAnswers(questions, answerOcrPages)
+  const { mappings } = await stage(jobId, 'mapping_answers', () =>
+    extractAndMapAnswers(questions, answerPages),
+  )
 
+  // Grading is best-effort: if it fails, the teacher still gets extraction + mapping.
   updateJob(jobId, { step: 'grading' })
   let grading = null
   try {
-    grading = await gradeAnswers(questions, mappings)
+    grading = await gradeAnswers(questions, mappings, answerPages)
   } catch (err) {
-    console.error(`Job ${jobId} grading failed (non-fatal):`, err)
+    console.error(`Job ${jobId} grading failed (non-fatal): ${err.message}`)
   }
 
-  const answerPageMeta = answerOcrPages.map((p) => ({ page: p.page, width: p.width, height: p.height, dataUrl: p.dataUrl }))
+  const answerPageMeta = answerPages.map((p) => ({ page: p.page, width: p.width, height: p.height, dataUrl: p.dataUrl }))
   const gradeById = new Map((grading?.grades ?? []).map((g) => [g.questionId, g]))
+  const mappingById = new Map(mappings.map((m) => [m.questionId, m]))
 
   const questionResults = questions.map((q) => {
-    const { regions: questionPaperRegions, ...questionRest } = q
-    const mapping = mappings.find((m) => m.questionId === q.id) ?? {
+    const { regions: _paperRegions, ...questionRest } = q
+    const mapping = mappingById.get(q.id) ?? {
       status: 'unanswered',
       answerText: null,
       selectedOption: null,
       regions: [],
     }
-    const grade = gradeById.get(q.id) ?? null
-    // `regions` here is the answer's location on the answer sheet (what the frontend highlights),
-    // not the question's own location on the question paper (questionPaperRegions, currently unused).
-    return { ...questionRest, ...mapping, grade }
+    const { _isObjective, ...mappingRest } = mapping
+    return { ...questionRest, ...mappingRest, grade: gradeById.get(q.id) ?? null }
   })
+
+  const lowConfidence = questionResults.filter((q) => q.grade?.confidence === 'low').length
 
   updateJob(jobId, {
     status: 'done',
     step: 'complete',
+    error: null,
     result: {
       questions: questionResults,
       answerPages: answerPageMeta,
       overallFeedback: grading?.overallFeedback ?? null,
+      gradingAvailable: !!grading,
+      lowConfidenceCount: lowConfidence,
     },
   })
 }
