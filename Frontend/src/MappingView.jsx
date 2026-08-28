@@ -12,6 +12,43 @@ const VERDICT_META = {
   unanswered: { label: 'Unanswered', className: 'verdict-unanswered' },
 }
 
+function isMcq(question) {
+  return question.questionType === 'mcq' || question.questionType === 'assertion_reason'
+}
+
+function normalizeLetter(value) {
+  if (value == null) return null
+  const s = String(value).trim().toLowerCase()
+  return s ? s.replace(/[^a-z0-9]/g, '') : null
+}
+
+// Renders the MCQ choice list, marking the student's pick and (once graded) the correct one.
+function McqOptions({ question }) {
+  const options = question.options ?? []
+  if (!options.length) return null
+  const selected = normalizeLetter(question.selectedOption)
+  const correct = normalizeLetter(question.grade?.correctOption)
+
+  return (
+    <ul className="mcq-options">
+      {options.map((opt) => {
+        const label = normalizeLetter(opt.label)
+        const isSelected = selected != null && label === selected
+        const isCorrect = correct != null && label === correct
+        const cls = ['mcq-option', isSelected && 'selected', isCorrect && 'correct'].filter(Boolean).join(' ')
+        return (
+          <li key={opt.label} className={cls}>
+            <span className="mcq-option-label">{opt.label}</span>
+            <span className="mcq-option-text">{opt.text}</span>
+            {isSelected && <span className="mcq-tag">Chosen</span>}
+            {isCorrect && !isSelected && <span className="mcq-tag mcq-tag-correct">Correct</span>}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
 function QuestionListItem({ question, isActive, onClick }) {
   const status = STATUS_META[question.status] ?? STATUS_META.unanswered
   const verdict = question.grade ? VERDICT_META[question.grade.verdict] : null
@@ -24,6 +61,7 @@ function QuestionListItem({ question, isActive, onClick }) {
         <span className={`status-pill ${status.className}`}>{status.label}</span>
       </div>
       <p className="question-text">{question.text}</p>
+      {isMcq(question) && <McqOptions question={question} />}
       <div className="question-item-bottom">
         {maxMarks != null && <span className="marks-tag">{maxMarks} marks</span>}
         {verdict && (
@@ -118,6 +156,89 @@ function AnswerSheetViewer({ answerPages, activeRegions }) {
   )
 }
 
+function ReviewPanel({ question }) {
+  if (!question) {
+    return (
+      <div className="review-panel">
+        <p className="review-empty">Select a question to see its review.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="review-panel">
+      <div className="review-header">
+        <span className="question-number">Q{question.displayNumber}</span>
+        {question.status === 'unanswered' ? (
+          <span className="status-pill status-unanswered">Not answered on sheet</span>
+        ) : (
+          <span className="status-pill status-answered">Answered</span>
+        )}
+      </div>
+
+      {question.grade?.feedback && (
+        <div className="review-section">
+          <h4 className="review-section-title">AI Feedback</h4>
+          <p className="answer-feedback">{question.grade.feedback}</p>
+        </div>
+      )}
+
+      {isMcq(question) ? (
+        <McqReview question={question} />
+      ) : (
+        <div className="review-section">
+          <h4 className="review-section-title">Extracted Answer</h4>
+          {question.answerText ? (
+            <p className="answer-transcript">&ldquo;{question.answerText}&rdquo;</p>
+          ) : (
+            <p className="review-empty">No answer text extracted for this question.</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function findOption(question, letter) {
+  const norm = normalizeLetter(letter)
+  if (norm == null) return null
+  return (question.options ?? []).find((o) => normalizeLetter(o.label) === norm) ?? null
+}
+
+function formatChoice(question, letter) {
+  const opt = findOption(question, letter)
+  if (opt) return `(${opt.label}) ${opt.text}`
+  return letter ? `(${letter})` : null
+}
+
+function McqReview({ question }) {
+  const student = formatChoice(question, question.selectedOption)
+  const correct = formatChoice(question, question.grade?.correctOption)
+
+  return (
+    <>
+      <div className="review-section">
+        <h4 className="review-section-title">Options</h4>
+        <McqOptions question={question} />
+      </div>
+      <div className="review-section">
+        <h4 className="review-section-title">Student&rsquo;s Answer</h4>
+        {student ? (
+          <p className="answer-transcript">{student}</p>
+        ) : (
+          <p className="review-empty">No option selected on the sheet.</p>
+        )}
+      </div>
+      {correct && (
+        <div className="review-section">
+          <h4 className="review-section-title">Correct Answer</h4>
+          <p className="answer-transcript">{correct}</p>
+        </div>
+      )}
+    </>
+  )
+}
+
 export default function MappingView({ result, onReset }) {
   const [selectedQuestionId, setSelectedQuestionId] = useState(result.questions[0]?.id ?? null)
 
@@ -164,26 +285,10 @@ export default function MappingView({ result, onReset }) {
         </div>
 
         <div className="answer-panel">
-          {selectedQuestion && (
-            <div className="answer-detail">
-              <div className="answer-detail-header">
-                <span className="question-number">Q{selectedQuestion.displayNumber}</span>
-                {selectedQuestion.status === 'unanswered' ? (
-                  <span className="status-pill status-unanswered">Not answered on sheet</span>
-                ) : (
-                  <span className="status-pill status-answered">Answered</span>
-                )}
-              </div>
-              {selectedQuestion.grade?.feedback && (
-                <p className="answer-feedback">{selectedQuestion.grade.feedback}</p>
-              )}
-              {selectedQuestion.answerText && (
-                <p className="answer-transcript">&ldquo;{selectedQuestion.answerText}&rdquo;</p>
-              )}
-            </div>
-          )}
           <AnswerSheetViewer answerPages={result.answerPages} activeRegions={activeRegions} />
         </div>
+
+        <ReviewPanel question={selectedQuestion} />
       </div>
     </div>
   )

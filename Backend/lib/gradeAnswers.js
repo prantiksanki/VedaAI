@@ -1,4 +1,5 @@
 import { callStructured } from './openaiClient.js'
+import { OBJECTIVE_QUESTION_TYPES } from './extractQuestions.js'
 
 const GRADING_SCHEMA = {
   type: 'object',
@@ -11,6 +12,11 @@ const GRADING_SCHEMA = {
         additionalProperties: false,
         properties: {
           questionId: { type: 'string' },
+          correctOption: {
+            type: ['string', 'null'],
+            description:
+              'For an MCQ / assertion-reason / true-false / fill-blank question: the LETTER of the option you determine is correct (e.g. "a"). null for open-ended questions.',
+          },
           effectiveMaxMarks: {
             type: 'number',
             description: 'The max marks used for this question - either the printed maxMarks if given, or your inferred ceiling based on question complexity',
@@ -27,7 +33,7 @@ const GRADING_SCHEMA = {
           score: { type: 'number', description: 'Score out of effectiveMaxMarks, 0 if unanswered' },
           feedback: { type: 'string', description: 'One to two sentence feedback for the student' },
         },
-        required: ['questionId', 'effectiveMaxMarks', 'expectedPoints', 'coveredPoints', 'verdict', 'score', 'feedback'],
+        required: ['questionId', 'correctOption', 'effectiveMaxMarks', 'expectedPoints', 'coveredPoints', 'verdict', 'score', 'feedback'],
       },
     },
     overallFeedback: {
@@ -40,7 +46,21 @@ const GRADING_SCHEMA = {
 
 const SYSTEM_PROMPT = `You are an experienced teacher grading a student's exam answers, weighting marks by how much each question actually demands.
 
-You will receive a list of questions (with printed maxMarks if available - may be null) and the student's transcribed answer for each (or "unanswered"). Each item also has "ocrLimited": true when the answer likely contains a diagram, drawing, or complex mathematical notation (equations with fractions, square roots, exponents, subscripts, etc).
+You will receive a list of questions (with printed maxMarks if available - may be null), each with a "questionType", and the student's transcribed answer for each (or "unanswered"). MCQ-style items also carry "options" (the answer choices) and "selectedOption" (the letter the student picked, or null). Each item also has "ocrLimited": true when the answer likely contains a diagram, drawing, or complex mathematical notation (equations with fractions, square roots, exponents, subscripts, etc).
+
+OBJECTIVE QUESTIONS - questionType "mcq", "assertion_reason", "true_false", or "fill_blank":
+- These are graded as a single right/wrong match, NOT by key-point coverage.
+- First, work out the correct answer YOURSELF from the question stem and the "options" list, and put its letter in "correctOption" (for true_false/fill_blank without lettered options, still reason out the correct answer and describe it in feedback; correctOption may be null there).
+- Then compare "selectedOption" (or the student's stated answer) to the correct answer:
+  - matches -> verdict "correct", score = effectiveMaxMarks, coveredPoints = expectedPoints.
+  - present but wrong -> verdict "incorrect", score = 0, coveredPoints = 0.
+  - "unanswered" / selectedOption null and no stated answer -> verdict "unanswered", score = 0.
+- effectiveMaxMarks = printed maxMarks if given, else 1. expectedPoints = 1.
+- Do NOT apply the key-point-coverage logic or the OCR-diagram leniency to these questions.
+- Feedback: state the correct option/answer; if the student was wrong, one short sentence on why.
+- Set "correctOption" to null for every open-ended (short_answer / long_answer / numerical) question.
+
+OPEN-ENDED QUESTIONS - questionType "short_answer", "long_answer", "numerical": grade as described below.
 
 IMPORTANT - OCR limitation: the "studentAnswer" text comes from OCR on handwriting, which can only capture words in reading order - it CANNOT represent diagrams, flowcharts, boxes, arrows, or the actual 2D structure of a mathematical derivation (fractions, roots, superscripts collapse into flat, sometimes garbled text). A hand-drawn block diagram legitimately produces VERY LITTLE linear text - maybe only 3-6 short labels (box/component names) - even when the student drew a completely correct, fully detailed diagram, because most of the diagram's information is in shapes, boxes, and arrows that OCR cannot read at all. Do not expect diagram answers to look like written paragraphs.
 
@@ -50,7 +70,7 @@ When "ocrLimited" is true for a question:
 - Only reduce the score if the OCR text contains labels/terms that are clearly WRONG or irrelevant to this specific question, or if there is no OCR text at all near this question (suggesting nothing was drawn).
 - In feedback, do not say detail, boxes, arrows, or diagram structure was missing - instead say the diagram/derivation itself could not be fully verified from the scan, and comment only on whether the visible labels/terms are correct for this question.
 
-For each question, work in two steps:
+For each open-ended question, work in two steps:
 
 STEP 1 - Determine effectiveMaxMarks:
 - If the question paper printed maxMarks for this question, use that value exactly.
@@ -77,7 +97,11 @@ const DIAGRAM_OR_FORMULA_PATTERN =
  * Heuristic: does this question likely expect a diagram or complex math notation
  * that OCR (which only captures words in reading order) cannot fully represent?
  */
-function isOcrLimited(questionText) {
+function isOcrLimited(questionText, questionType) {
+  // Objective questions (MCQ, true/false, etc.) are graded as a single right/wrong
+  // match - a wrong answer must be able to score 0, so the diagram/formula floor
+  // never applies to them regardless of any keyword in the stem.
+  if (OBJECTIVE_QUESTION_TYPES.has(questionType)) return false
   return DIAGRAM_OR_FORMULA_PATTERN.test(questionText)
 }
 
@@ -98,7 +122,7 @@ function applyOcrLimitedFloor(questions, mappingById, grades) {
     const question = questionById.get(grade.questionId)
     const mapping = mappingById.get(grade.questionId)
     if (!question || !mapping || mapping.status !== 'answered') return grade
-    if (!isOcrLimited(question.text)) return grade
+    if (!isOcrLimited(question.text, question.questionType)) return grade
     if ((mapping.answerText?.length ?? 0) < OCR_LIMITED_MIN_ANSWER_LENGTH) return grade
     // Require the LLM to have found at least some genuine coverage - this is what
     // distinguishes "thin OCR of real diagram content" from "off-topic/no-answer text
@@ -118,22 +142,26 @@ function applyOcrLimitedFloor(questions, mappingById, grades) {
 }
 
 /**
- * @param {Array<{id:string, displayNumber:string, text:string, maxMarks:number|null}>} questions
- * @param {Array<{questionId:string, status:string, answerText:string|null}>} mappings
+ * @param {Array<{id:string, displayNumber:string, text:string, maxMarks:number|null, questionType?:string, options?:Array<{label:string,text:string}>}>} questions
+ * @param {Array<{questionId:string, status:string, answerText:string|null, selectedOption?:string|null}>} mappings
  */
 export async function gradeAnswers(questions, mappings) {
   const mappingById = new Map(mappings.map((m) => [m.questionId, m]))
 
   const payload = questions.map((q) => {
     const mapping = mappingById.get(q.id)
+    const questionType = q.questionType ?? 'long_answer'
     return {
       questionId: q.id,
       displayNumber: q.displayNumber,
+      questionType,
       questionText: q.text,
+      options: q.options ?? [],
       maxMarks: q.maxMarks,
       studentAnswer: mapping?.status === 'answered' ? mapping.answerText : null,
+      selectedOption: mapping?.selectedOption ?? null,
       status: mapping?.status ?? 'unanswered',
-      ocrLimited: isOcrLimited(q.text),
+      ocrLimited: isOcrLimited(q.text, questionType),
     }
   })
 
@@ -151,8 +179,54 @@ export async function gradeAnswers(questions, mappings) {
     schema: GRADING_SCHEMA,
   })
 
+  const withOcrFloor = applyOcrLimitedFloor(questions, mappingById, result.grades)
   return {
     ...result,
-    grades: applyOcrLimitedFloor(questions, mappingById, result.grades),
+    grades: enforceObjectiveGrades(questions, mappingById, withOcrFloor),
   }
+}
+
+/**
+ * Deterministic backstop for objective questions: once the LLM has decided which
+ * option is correct, the verdict/score is a mechanical comparison. The LLM is not
+ * always consistent about this (same failure mode as applyOcrLimitedFloor), so
+ * recompute it here rather than trust the model's arithmetic.
+ */
+function enforceObjectiveGrades(questions, mappingById, grades) {
+  const questionById = new Map(questions.map((q) => [q.id, q]))
+
+  return grades.map((grade) => {
+    const question = questionById.get(grade.questionId)
+    if (!question || !OBJECTIVE_QUESTION_TYPES.has(question.questionType)) return grade
+
+    const mapping = mappingById.get(grade.questionId)
+    const selected = mapping?.selectedOption ?? null
+    const correct = grade.correctOption ?? null
+    const maxMarks = question.maxMarks ?? grade.effectiveMaxMarks ?? 1
+
+    // Unanswered: nothing selected.
+    if (mapping?.status !== 'answered' || !selected) {
+      return {
+        ...grade,
+        effectiveMaxMarks: maxMarks,
+        expectedPoints: 1,
+        coveredPoints: 0,
+        verdict: 'unanswered',
+        score: 0,
+      }
+    }
+
+    // Can't determine correctness (LLM gave no correctOption) - leave the LLM's own call.
+    if (!correct) return { ...grade, effectiveMaxMarks: maxMarks, expectedPoints: 1 }
+
+    const isRight = selected.toLowerCase() === correct.toLowerCase()
+    return {
+      ...grade,
+      effectiveMaxMarks: maxMarks,
+      expectedPoints: 1,
+      coveredPoints: isRight ? 1 : 0,
+      verdict: isRight ? 'correct' : 'incorrect',
+      score: isRight ? maxMarks : 0,
+    }
+  })
 }
