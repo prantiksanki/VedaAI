@@ -1,5 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
-import { requestCheckedCopy } from './api.js'
+import { requestCheckedCopy, requestPlagiarismReport } from './api.js'
+
+const MIN_PLAGIARISM_CHARS = 300
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob)
@@ -276,6 +278,8 @@ export default function MappingView({ result, onReset }) {
   const [selectedQuestionId, setSelectedQuestionId] = useState(result.questions[0]?.id ?? null)
   const [copyStatus, setCopyStatus] = useState('idle') // 'idle' | 'loading' | 'error'
   const [copyError, setCopyError] = useState(null)
+  const [reportStatus, setReportStatus] = useState('idle') // 'idle' | 'loading' | 'error'
+  const [reportError, setReportError] = useState(null)
 
   const selectedQuestion = result.questions.find((q) => q.id === selectedQuestionId) ?? null
 
@@ -293,6 +297,9 @@ export default function MappingView({ result, onReset }) {
       .map(({ q }) => q)
   }, [result.questions])
 
+  const questionPaperText = result.questionPaperText ?? ''
+  const canCheckPlagiarism = questionPaperText.trim().length >= MIN_PLAGIARISM_CHARS
+
   function selectQuestion(id) {
     setSelectedQuestionId(id)
   }
@@ -307,6 +314,19 @@ export default function MappingView({ result, onReset }) {
     } catch (err) {
       setCopyError(err.message)
       setCopyStatus('error')
+    }
+  }
+
+  async function handlePlagiarismCheck() {
+    setReportStatus('loading')
+    setReportError(null)
+    try {
+      const blob = await requestPlagiarismReport(questionPaperText)
+      downloadBlob(blob, 'ai-content-detection-report.pdf')
+      setReportStatus('idle')
+    } catch (err) {
+      setReportError(err.message)
+      setReportStatus('error')
     }
   }
 
@@ -332,6 +352,22 @@ export default function MappingView({ result, onReset }) {
             {!hasGrading && <span className="checked-copy-hint">Grading unavailable</span>}
             {copyStatus === 'error' && copyError && (
               <span className="checked-copy-error">{copyError}</span>
+            )}
+          </div>
+          <div className="plagiarism-action">
+            <button
+              type="button"
+              className="plagiarism-btn"
+              onClick={handlePlagiarismCheck}
+              disabled={!canCheckPlagiarism || reportStatus === 'loading'}
+            >
+              {reportStatus === 'loading' ? 'Generating report…' : 'AI Plagiarism Checker'}
+            </button>
+            {!canCheckPlagiarism && (
+              <span className="plagiarism-hint">Not enough question-paper text to analyze</span>
+            )}
+            {reportStatus === 'error' && reportError && (
+              <span className="plagiarism-error">{reportError}</span>
             )}
           </div>
           <button type="button" className="reset-btn" onClick={onReset}>

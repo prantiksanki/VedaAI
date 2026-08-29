@@ -13,6 +13,23 @@ export async function uploadFiles(questionPaper, answerSheet) {
   return res.json() // { jobId }
 }
 
+/**
+ * Sends the question-paper text to the backend, which runs Winston AI content
+ * detection and returns a PDF report as a Blob.
+ */
+export async function requestPlagiarismReport(text) {
+  const res = await fetch(`${API_BASE}/api/plagiarism-report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `Report failed (${res.status})`)
+  }
+  return res.blob()
+}
+
 export async function getJob(jobId) {
   const res = await fetch(`${API_BASE}/api/jobs/${jobId}`)
   if (!res.ok) {
