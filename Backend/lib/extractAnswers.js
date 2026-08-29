@@ -1,328 +1,248 @@
-import fs from 'fs'
-import { callStructured } from './openaiClient.js'
+import { callStructured, userContent } from './llmClient.js'
 import { OBJECTIVE_QUESTION_TYPES } from './extractQuestions.js'
+import { annotateLines } from './annotateLines.js'
 
-const PAGES_PER_CHUNK = 4
-const CHUNK_OVERLAP = 1 // pages repeated between consecutive chunks, so an answer split across a chunk boundary isn't cut off
+// How many answer-sheet page images per vision call. Small so each answer's location
+// stays precise and the model isn't overwhelmed.
+const PAGES_PER_CALL = 2
 
-const MAPPING_SCHEMA = {
+const ANSWERS_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    mappings: {
+    answers: {
       type: 'array',
-      description: 'One entry per question from the provided question list that has an answer visible in this batch of pages. Omit questions with no trace here.',
+      description: 'One entry per question that has ANY student work visible in these pages. Omit questions with nothing here.',
       items: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          questionId: { type: 'string', description: 'The id of the question this maps to, copied exactly from the provided list' },
-          answerText: {
+          questionId: { type: 'string', description: 'id copied exactly from the provided question list' },
+          answered: { type: 'boolean', description: 'true if the student made any attempt at this question in these pages' },
+          transcription: {
             type: 'string',
-            description: 'Transcribed/reconstructed answer text found in this batch of pages. For an MCQ, a short human string like "(c) 12".',
+            description: 'Verbatim transcription of the student\'s answer (working, sentences, final result, diagram labels). "" if nothing written but an option was marked.',
           },
           selectedOption: {
             type: ['string', 'null'],
-            description:
-              'For an MCQ question only: the option LETTER the student selected (e.g. "c"), normalized to just the letter. null for non-MCQ questions or if the student made no visible choice.',
+            description: 'For MCQ/assertion_reason: the chosen option LETTER. For true_false: "true" or "false". For fill_blank: the text the student wrote in the blank. null if not applicable / nothing chosen.',
           },
           lineRefs: {
             type: 'array',
-            description: 'References to the OCR lines that make up this answer, within this batch of pages.',
+            description: 'Which numbered line markers (the red boxed numbers printed on the image) belong to this answer\'s OWN written content - never the question-label line. One entry per page the answer appears on.',
             items: {
               type: 'object',
               additionalProperties: false,
               properties: {
-                page: { type: 'number', description: 'Page number (1-indexed), matching the page numbers shown in this batch' },
-                lineIndices: {
-                  type: 'array',
-                  items: { type: 'number' },
-                  description: 'Indices from that page\'s numbered OCR line list that belong to this answer',
-                },
+                page: { type: 'number', description: 'page number as labelled for the image this line is in' },
+                lineIndices: { type: 'array', items: { type: 'number' }, description: 'the line-marker numbers on that page that are this answer' },
               },
               required: ['page', 'lineIndices'],
             },
           },
+          continuesBeyondThesePages: {
+            type: 'boolean',
+            description: 'true if this answer clearly runs onto a page not shown in this call',
+          },
         },
-        required: ['questionId', 'answerText', 'selectedOption', 'lineRefs'],
+        required: ['questionId', 'answered', 'transcription', 'selectedOption', 'lineRefs', 'continuesBeyondThesePages'],
       },
     },
   },
-  required: ['mappings'],
+  required: ['answers'],
 }
 
-const SYSTEM_PROMPT = `You are an expert at matching a student's answer-sheet content to a known list of exam questions, using OCR output (handwriting recognized to text, may contain errors).
+const SYSTEM_PROMPT = `You are matching a student's handwritten answer sheet to a known list of exam questions. You are shown page images of the answer sheet and the full question list.
 
-You will receive:
-1. The full list of questions for this exam (id, displayNumber, text, questionType, options) - for context, so you can recognize an answer even if only some of these questions appear in this batch of pages.
-2. OCR output for a BATCH of consecutive pages from the student's answer sheet (not necessarily the whole answer sheet): for each page, a numbered list of recognized text lines in top-to-bottom reading order.
+Every line of text on each page image has a small numbered red marker printed just to its left (0, 1, 2, ...), with a thin red outline around the exact line it labels. Use these numbers to report WHERE an answer is - never guess coordinates.
 
-Your task:
-- Only report on content that is ACTUALLY VISIBLE in this batch of pages. Do not guess about questions that might be answered on other pages not shown here.
-- For each question you find an answer to in this batch, add an entry to "mappings": which question it is, the reconstructed answer text, and exactly which OCR lines (by page and index, using the page numbers as labeled in this batch) make up that answer.
-- MCQ QUESTIONS (questionType "mcq" or "assertion_reason"): the student's "answer" is WHICH OPTION they picked. It may be written as a bare letter ("c"), "(c)", "Ans: c", "Q1 - c", the option's VALUE copied out ("12"), or a letter next to a tick/circle/underline. Set "selectedOption" to just the letter. If the student wrote the option's value rather than its letter, match it back to a letter using the "options" list provided for that question. Set "answerText" to a short readable string like "(c) 12". If no choice is visible for that MCQ in this batch, do not report it (leave it for another batch / mark unanswered later). Set "selectedOption" to null for every non-MCQ question.
-- An answer may span multiple pages within this batch - include a lineRefs entry per page.
-- If a question's answer clearly continues from the previous page but the question label isn't repeated, still attribute it to the right question by content and position.
-- Do NOT include a question's own printed statement/text if the student copied it onto the answer sheet before writing their answer - only include the lines that are the student's actual answer (working, explanation, diagram labels, final result), not a restatement of the question.
-- Do NOT include questions that have no visible answer in this batch - simply omit them (do not report "unanswered" here, since a question absent from this batch might be answered elsewhere).
-- Ignore content that doesn't correspond to any question (stray notes, rough work headers, illegible scribbles) - do not force it onto an unrelated question, just leave it out.
-- Only reference line indices that actually belong to that answer - do not include neighboring unrelated lines, since these are used to draw a precise highlight for a teacher.
-- If an answer's text continues across several consecutive lines with no break in the content (no new question label, no unrelated text in between), include EVERY one of those consecutive lines in lineIndices - do not skip a line in the middle just because it feels redundant. A gap in the middle of an otherwise continuous answer produces a broken, incomplete-looking highlight for the teacher.
-- Watch handwritten or printed question labels carefully - the label is the most reliable signal for which question an answer belongs to. Labels appear in MANY different formats and you must match them to a question by their NUMBER AND SUB-PART, not by exact string form. For example "Q2-a", "Q2 (a)", "Q2a", "2.a", "Q-2 a)" all refer to the same question if the question list has a question numbered 2 with subpart a. Be flexible with punctuation, spacing, and hyphens/parentheses when matching a label to a question's displayNumber.
-- CORRECT OCR NOISE: handwriting OCR frequently mangles individual letters/words (e.g. "Choractountres" for "characteristics", "trammision" for "transmission", "chrumosogres" for "chromosomes"). Use the question's own text and the surrounding sentence context to recognize and correct these into the real, properly-spelled words the student almost certainly wrote. Produce the answerText as clean, correctly-spelled, readable text - never output obviously-garbled OCR noise verbatim. Only if a word is truly unrecoverable (no plausible reading from context) should you keep it as-is or mark it with [?]. This correction applies to answerText only - do not alter which lineIndices you select based on this.`
+For every question that has ANY student work visible in these page images, output one "answers" entry:
+- "questionId": copy the id exactly from the question list. Match by the student's written question label (which appears in many forms — "Q2", "2)", "Ans 2", "2.a", "Q-2(a)") AND by the content matching the question. If a label is ambiguous, use the content.
+- "answered": true if the student attempted it here (wrote anything, or marked/circled an option).
+- "transcription": transcribe the student's actual answer VERBATIM — their working, sentences, final answers, diagram labels. Fix only obvious slip-of-the-pen letter shapes; keep the student's actual words, numbers, and mistakes. Transcribe math in plain text (x^2, sqrt(25), <=). Do NOT include the question's printed statement if the student copied it out — only their answer. If the student only marked an option and wrote no prose, use "".
+- "selectedOption":
+    · MCQ / assertion_reason → the LETTER the student chose (from a written letter, a circled/ticked/underlined option, or the option's value written out — match a written-out value back to its letter using the question's "options").
+    · true_false → "true" or "false".
+    · fill_blank → the exact text the student wrote in the blank.
+    · otherwise → null.
+- "lineRefs": for each page this answer appears on, list the numbered line-marker(s) that are this answer's OWN content — e.g. if the marker-3 line and marker-4 line are the two lines the student wrote for this answer, report lineIndices [3, 4]. Include EVERY consecutive line that is genuinely part of this one answer (working spanning several lines). Do NOT include the line carrying the question's own label/number (e.g. the "Q11." line) unless the student's answer starts on that same line right after the label — in that case include it too. Do NOT include neighbouring questions' lines.
+- "continuesBeyondThesePages": true if the answer obviously runs onto a page you weren't shown.
 
-const SINGLE_QUESTION_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    found: { type: 'boolean', description: 'true if an answer to this specific question is visible in the provided pages' },
-    answerText: { type: ['string', 'null'], description: 'Transcribed answer text if found, else null. For an MCQ, a short string like "(c) 12".' },
-    selectedOption: {
-      type: ['string', 'null'],
-      description: 'For an MCQ question: the option LETTER the student selected (e.g. "c"), else null.',
-    },
-    lineRefs: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          page: { type: 'number' },
-          lineIndices: { type: 'array', items: { type: 'number' } },
-        },
-        required: ['page', 'lineIndices'],
-      },
-    },
-  },
-  required: ['found', 'answerText', 'selectedOption', 'lineRefs'],
-}
+Only report what is actually visible here. Do not invent answers for questions with no work on these pages — just omit them.`
 
-const SINGLE_QUESTION_SYSTEM_PROMPT = `You are checking a student's answer sheet for the answer to ONE SPECIFIC exam question, using OCR output (may contain recognition errors).
+async function readChunk(questionList, pages) {
+  const annotated = await Promise.all(
+    pages.map((p) => annotateLines(p.dataUrl, { width: p.width, height: p.height }, p.lines)),
+  )
+  const labelled = pages
+    .map((p, i) => `Image ${i + 1} is answer-sheet page ${p.page}, with ${p.lines.length} numbered line markers (0-${p.lines.length - 1}).`)
+    .join('\n')
 
-You will receive the question (displayNumber, text, questionType, options) and OCR lines from pages where its label plausibly appears.
-
-Task:
-- Determine whether this question's answer is genuinely present in these pages.
-- Labels can appear in many formats (e.g. "Q2-a", "Q2 (a)", "Q2a", "2.a") - match by number and sub-part, not exact string.
-- If this is an MCQ (questionType "mcq" or "assertion_reason"): the answer is which option the student picked - a bare letter, "(c)", "Ans c", the option value copied out, or a circled/ticked choice. If found, set found=true, selectedOption to just the letter (match a written-out value back to its letter using "options"), and answerText to a short string like "(c) 12". Set selectedOption to null for non-MCQ questions.
-- If found, set found=true, give the reconstructed answer text, and list exactly which OCR lines (page + index) make up the answer - only the actual answer content, not a restated question.
-- If the answer continues across several consecutive lines with no break in content, include EVERY one of those consecutive lines - do not skip a line in the middle, since a gap produces a broken-looking highlight for the teacher.
-- CORRECT OCR NOISE: use the question's own text and sentence context to correct mangled OCR words into the real, properly-spelled words the student almost certainly wrote. Produce answerText as clean, readable text - never output garbled OCR noise verbatim. Only keep a word as-is (or mark [?]) if truly unrecoverable.
-- If truly not present, set found=false, answerText null, selectedOption null, lineRefs empty.`
-
-/**
- * Extracts the leading number (and optional single-letter subpart) from a displayNumber
- * like "Q2-a", "Q11 (b)", "5", "Q7." -> { number: "2", subpart: "a" | null }
- */
-function parseLabel(displayNumber) {
-  const match = displayNumber.match(/(\d+)\s*[\s.\-()]*\s*([a-zA-Z]?)/)
-  if (!match) return null
-  return { number: match[1], subpart: match[2] ? match[2].toLowerCase() : null }
-}
-
-function findCandidatePages(question, ocrPages) {
-  const label = parseLabel(question.displayNumber)
-  if (!label) return []
-  const numberPattern = new RegExp(`(?<!\\d)${label.number}(?!\\d)`)
-  const candidates = []
-  for (const page of ocrPages) {
-    const hasCandidate = page.lines.some((line) => numberPattern.test(line.text))
-    if (hasCandidate) candidates.push(page)
-  }
-  return candidates
-}
-
-async function retryQuestion(question, candidatePages) {
-  const ocrText = candidatePages
-    .map((page) => {
-      const numberedLines = page.lines.map((line, i) => `[${i}] ${line.text}`).join('\n')
-      return `--- Answer Sheet Page ${page.page} (OCR lines) ---\n${numberedLines}`
-    })
-    .join('\n\n')
-
-  const userText = `Question (JSON):\n${JSON.stringify(
-    { displayNumber: question.displayNumber, text: question.text, questionType: question.questionType, options: question.options ?? [] },
-    null,
-    2
-  )}\n\nCandidate pages (where this question's number appears somewhere):\n\n${ocrText}`
-
-  return callStructured({
-    systemPrompt: SINGLE_QUESTION_SYSTEM_PROMPT,
-    userContent: [{ type: 'text', text: userText }],
-    schemaName: 'single_question_check',
-    schema: SINGLE_QUESTION_SCHEMA,
+  const result = await callStructured({
+    system: SYSTEM_PROMPT,
+    content: userContent(
+      `Question list (JSON):\n${JSON.stringify(questionList, null, 2)}\n\n${labelled}\n\nFind every student answer visible on these pages.`,
+      annotated,
+    ),
+    schemaName: 'answer_reading',
+    schema: ANSWERS_SCHEMA,
+    stage: 'extractAnswers',
   })
+  return result.answers ?? []
 }
 
-function chunkPages(ocrPages) {
-  const chunks = []
-  const step = PAGES_PER_CHUNK - CHUNK_OVERLAP
-  for (let start = 0; start < ocrPages.length; start += step) {
-    const chunk = ocrPages.slice(start, start + PAGES_PER_CHUNK)
-    chunks.push(chunk)
-    if (start + PAGES_PER_CHUNK >= ocrPages.length) break
-  }
-  return chunks
-}
-
-async function mapChunk(questionList, chunk) {
-  const ocrText = chunk
-    .map((page) => {
-      const numberedLines = page.lines.map((line, i) => `[${i}] ${line.text}`).join('\n')
-      return `--- Answer Sheet Page ${page.page} (OCR lines) ---\n${numberedLines}`
-    })
-    .join('\n\n')
-
-  const userText = `Full question list for this exam (JSON):\n${JSON.stringify(questionList, null, 2)}\n\nThis batch covers pages ${chunk[0].page}-${chunk[chunk.length - 1].page} of the answer sheet:\n\n${ocrText}`
-
-  return callStructured({
-    systemPrompt: SYSTEM_PROMPT,
-    userContent: [{ type: 'text', text: userText }],
-    schemaName: 'answer_mapping_chunk',
-    schema: MAPPING_SCHEMA,
-  })
+function chunkPages(pages, size) {
+  const out = []
+  for (let i = 0; i < pages.length; i += size) out.push(pages.slice(i, i + size))
+  return out
 }
 
 /**
- * @param {Array<{id:string, displayNumber:string, text:string, questionType?:string, options?:Array<{label:string,text:string}>}>} questions
- * @param {Array<{page:number, width:number, height:number, lines: Array<{text:string,x:number,y:number,width:number,height:number}>}>} ocrPages
+ * Resolves lineRefs (page + line index) against the detected line geometry into
+ * normalized 0..1 regions, merging adjacent same-answer lines into contiguous boxes.
  */
-export async function extractAndMapAnswers(questions, ocrPages) {
+function resolveRegions(lineRefs, pagesByNumber) {
+  const regions = []
+  for (const ref of lineRefs ?? []) {
+    const page = pagesByNumber.get(ref.page)
+    if (!page) continue
+    for (const idx of ref.lineIndices ?? []) {
+      const line = page.lines[idx]
+      if (!line) continue
+      regions.push({ page: ref.page, x: line.x, y: line.y, width: line.width, height: line.height })
+    }
+  }
+  return regions
+}
+
+/**
+ * @param {Array<object>} questions - from extractQuestions (have stable `id`)
+ * @param {Array<{ page:number, width:number, height:number, dataUrl:string }>} answerPages
+ * @param {Array<{ page:number, width:number, height:number, lines:Array }>|null} lineGeometry
+ *   - from lib/lineGeometry.js `detectLines()`, or null if that service was unreachable
+ *     (extraction/grading still work then, just without highlight boxes).
+ * @returns {Promise<{ mappings: Array<{ questionId, status, answerText, selectedOption, regions }> }>}
+ */
+export async function extractAndMapAnswers(questions, answerPages, lineGeometry = null) {
   const questionList = questions.map((q) => ({
     id: q.id,
     displayNumber: q.displayNumber,
-    text: q.text,
     questionType: q.questionType ?? 'long_answer',
+    text: q.text,
     options: q.options ?? [],
   }))
-  const pageByNumber = new Map(ocrPages.map((p) => [p.page, p]))
+  const questionById = new Map(questions.map((q) => [q.id, q]))
 
-  function resolveRegions(lineRefs) {
-    const regions = []
-    for (const ref of lineRefs ?? []) {
-      const page = pageByNumber.get(ref.page)
-      if (!page) continue
-      for (const i of ref.lineIndices ?? []) {
-        const line = page.lines[i]
-        if (line) regions.push({ page: ref.page, x: line.x, y: line.y, width: line.width, height: line.height })
-      }
-    }
-    return regions
+  const linesByPage = new Map()
+  if (lineGeometry) {
+    for (const gp of lineGeometry) linesByPage.set(gp.page, gp.lines)
   }
+  const pagesWithLines = answerPages.map((p) => ({ ...p, lines: linesByPage.get(p.page) ?? [] }))
+  const pagesByNumber = new Map(pagesWithLines.map((p) => [p.page, p]))
 
-  const chunks = chunkPages(ocrPages)
-  const chunkResults = await Promise.all(chunks.map((chunk) => mapChunk(questionList, chunk)))
+  const groups = chunkPages(pagesWithLines, PAGES_PER_CALL)
+  const perGroup = await Promise.all(groups.map((g) => readChunk(questionList, g)))
 
-  if (process.env.DEBUG_DUMP === '1') {
-    try {
-      fs.mkdirSync('./debug', { recursive: true })
-      const stamp = Date.now()
-      fs.writeFileSync(`./debug/${stamp}-chunk-results.json`, JSON.stringify(chunkResults, null, 2))
-      console.log(`[debug] dumped ${chunks.length} chunk results to ./debug/${stamp}-chunk-results.json`)
-    } catch (err) {
-      console.error('[debug] failed to write debug dump:', err.message)
-    }
-  }
-
-  // Merge per-question findings across chunks (a question can legitimately appear in
-  // two chunks near an overlap boundary - combine their regions and prefer the longer answer text).
-  const byQuestionId = new Map()
-  for (const chunkResult of chunkResults) {
-    for (const m of chunkResult.mappings ?? []) {
-      const regions = resolveRegions(m.lineRefs)
-      const existing = byQuestionId.get(m.questionId)
+  // Reconcile by questionId across page-calls.
+  const byId = new Map()
+  for (const answers of perGroup) {
+    for (const a of answers) {
+      if (!questionById.has(a.questionId)) continue // ignore hallucinated ids
+      const regions = resolveRegions(a.lineRefs, pagesByNumber)
+      const existing = byId.get(a.questionId)
       if (!existing) {
-        byQuestionId.set(m.questionId, { answerText: m.answerText, selectedOption: m.selectedOption ?? null, regions })
-      } else {
-        existing.regions = dedupeRegions([...existing.regions, ...regions])
-        if ((m.answerText?.length ?? 0) > (existing.answerText?.length ?? 0)) {
-          existing.answerText = m.answerText
-        }
-        // Prefer any chunk that actually resolved a chosen option.
-        if (!existing.selectedOption && m.selectedOption) {
-          existing.selectedOption = m.selectedOption
-        }
-      }
-    }
-  }
-
-  // Verification pass: for any question the chunked pass found no trace of, check whether
-  // its number appears anywhere in the OCR text (a plausible sign it was actually missed
-  // rather than genuinely unanswered), and if so retry it with a focused, single-question call.
-  const stillMissing = questions.filter((q) => !byQuestionId.has(q.id))
-  const retryTargets = stillMissing
-    .map((q) => ({ question: q, candidatePages: findCandidatePages(q, ocrPages) }))
-    .filter((t) => t.candidatePages.length > 0)
-
-  if (retryTargets.length > 0) {
-    const retryResults = await Promise.all(
-      retryTargets.map((t) => retryQuestion(t.question, t.candidatePages))
-    )
-    retryTargets.forEach((t, i) => {
-      const r = retryResults[i]
-      if (r.found) {
-        byQuestionId.set(t.question.id, {
-          answerText: r.answerText,
-          selectedOption: r.selectedOption ?? null,
-          regions: resolveRegions(r.lineRefs),
+        byId.set(a.questionId, {
+          answered: !!a.answered,
+          transcription: a.transcription ?? '',
+          selectedOption: a.selectedOption ?? null,
+          regions,
+          firstPage: regions[0]?.page ?? Infinity,
         })
-      }
-    })
-
-    if (process.env.DEBUG_DUMP === '1') {
-      try {
-        fs.mkdirSync('./debug', { recursive: true })
-        const stamp = Date.now()
-        fs.writeFileSync(
-          `./debug/${stamp}-retry-results.json`,
-          JSON.stringify(retryTargets.map((t, i) => ({ questionId: t.question.id, displayNumber: t.question.displayNumber, result: retryResults[i] })), null, 2)
-        )
-      } catch (err) {
-        console.error('[debug] failed to write retry debug dump:', err.message)
+      } else {
+        const thisFirstPage = regions[0]?.page ?? Infinity
+        existing.regions = dedupeRegions([...existing.regions, ...regions])
+        existing.answered = existing.answered || !!a.answered
+        if (!existing.selectedOption && a.selectedOption) existing.selectedOption = a.selectedOption
+        // Prefer the transcription from the call that saw the answer's start (has the label
+        // / question number), not merely the longest text.
+        if (thisFirstPage < existing.firstPage && (a.transcription ?? '').trim()) {
+          existing.transcription = a.transcription
+          existing.firstPage = thisFirstPage
+        } else if (existing.firstPage === Infinity && (a.transcription ?? '').trim()) {
+          existing.transcription = a.transcription
+        }
       }
     }
   }
 
   const mappings = questions.map((q) => {
-    const found = byQuestionId.get(q.id)
+    const found = byId.get(q.id)
     if (!found) {
       return { questionId: q.id, status: 'unanswered', answerText: null, selectedOption: null, regions: [] }
     }
-    const selectedOption = normalizeOptionLetter(found.selectedOption)
-    // For an MCQ, a mapping with no resolvable chosen option is effectively unanswered -
-    // there's nothing to grade against the correct option.
     const isObjective = OBJECTIVE_QUESTION_TYPES.has(q.questionType)
-    if (isObjective && !selectedOption) {
-      return { questionId: q.id, status: 'unanswered', answerText: found.answerText ?? null, selectedOption: null, regions: found.regions }
+    const selectedOption = normalizeSelected(found.selectedOption, q.questionType)
+    const hasText = (found.transcription ?? '').trim().length > 0
+    const answered = found.answered || hasText || selectedOption != null
+
+    if (!answered) {
+      return { questionId: q.id, status: 'unanswered', answerText: null, selectedOption: null, regions: found.regions }
     }
-    return { questionId: q.id, status: 'answered', answerText: found.answerText, selectedOption, regions: found.regions }
+    return {
+      questionId: q.id,
+      status: 'answered',
+      answerText: hasText ? found.transcription : null,
+      selectedOption,
+      regions: found.regions,
+      // objective questions with no resolvable choice are still "answered" (student wrote
+      // something) — grading decides what that's worth; we no longer force "unanswered".
+      _isObjective: isObjective,
+    }
   })
 
   return { mappings }
 }
 
 /**
- * Reduce a written option marker to a bare lowercase letter: "(C)" -> "c", "B." -> "b",
- * "option a" -> "a", "iii" -> "iii" (roman numerals kept as-is). null/empty -> null.
+ * Canonicalize the model's selectedOption for its question type.
+ *  - mcq/assertion_reason: a bare lowercase letter, or a roman numeral kept as-is
+ *  - true_false: "true" | "false"
+ *  - fill_blank: the trimmed text
+ *  - anything unresolvable -> null
  */
-function normalizeOptionLetter(raw) {
+function normalizeSelected(raw, questionType) {
   if (raw == null) return null
-  const s = String(raw).trim().toLowerCase()
+  const s = String(raw).trim()
   if (!s) return null
-  const roman = s.match(/^\(?\s*(i{1,3}|iv|v|vi{1,3}|ix|x)\s*\)?[.)]?$/)
+
+  if (questionType === 'true_false') {
+    const low = s.toLowerCase()
+    if (/^(t|true|correct|yes)\b/.test(low)) return 'true'
+    if (/^(f|false|incorrect|no)\b/.test(low)) return 'false'
+    return null
+  }
+  if (questionType === 'fill_blank') {
+    return s
+  }
+  // mcq / assertion_reason: pull out the option marker
+  const low = s.toLowerCase()
+  const roman = low.match(/^\(?\s*(i{1,3}|iv|v|vi{1,3}|ix|x)\s*\)?[.)]?$/)
   if (roman) return roman[1]
-  const letter = s.match(/([a-z])/)
-  return letter ? letter[1] : null
+  // "option b", "ans: c", "(d)", "d." -> take the LAST standalone a-h letter
+  const letters = low.match(/\b([a-h])\b/g)
+  if (letters && letters.length) return letters[letters.length - 1]
+  const anyLetter = low.match(/([a-h])/)
+  return anyLetter ? anyLetter[1] : null
 }
 
 function dedupeRegions(regions) {
   const seen = new Set()
-  const result = []
+  const out = []
   for (const r of regions) {
-    const key = `${r.page}:${r.x}:${r.y}:${r.width}:${r.height}`
+    const key = `${r.page}:${r.x.toFixed(3)}:${r.y.toFixed(3)}:${r.width.toFixed(3)}:${r.height.toFixed(3)}`
     if (seen.has(key)) continue
     seen.add(key)
-    result.push(r)
+    out.push(r)
   }
-  return result
+  return out
 }

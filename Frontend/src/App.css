@@ -544,6 +544,7 @@
   gap: 12px;
 }
 
+.checked-copy-action,
 .plagiarism-action {
   display: flex;
   flex-direction: column;
@@ -552,6 +553,7 @@
   max-width: 260px;
 }
 
+.checked-copy-btn,
 .plagiarism-btn {
   padding: 10px 20px;
   border-radius: 999px;
@@ -563,23 +565,57 @@
   cursor: pointer;
   white-space: nowrap;
 }
+.checked-copy-btn:not(:disabled):hover,
 .plagiarism-btn:not(:disabled):hover {
   box-shadow: 0 6px 18px rgba(170, 59, 255, 0.3);
 }
+.checked-copy-btn:disabled,
 .plagiarism-btn:disabled {
   background: #d9d7dc;
   cursor: not-allowed;
 }
 
+.checked-copy-hint,
 .plagiarism-hint {
   font-size: 12px;
   color: #9a97a3;
   text-align: right;
 }
+.checked-copy-error,
 .plagiarism-error {
   font-size: 12px;
   color: #c0392b;
   text-align: right;
+}
+
+.review-banner {
+  background: #fff5e6;
+  border: 1px solid #f0c987;
+  color: #8a5a00;
+  border-radius: 12px;
+  padding: 12px 16px;
+  font-size: 13.5px;
+  margin-bottom: 16px;
+}
+
+.review-chip {
+  display: inline-block;
+  background: #f0a020;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+}
+
+.question-item.needs-review {
+  border-color: #f0c987;
+  box-shadow: inset 3px 0 0 #f0a020;
+}
+
+.review-section.review-flag .answer-feedback {
+  color: #8a5a00;
 }
 
 .overall-feedback {

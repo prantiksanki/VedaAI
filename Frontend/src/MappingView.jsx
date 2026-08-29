@@ -1,7 +1,18 @@
 import { useMemo, useRef, useState } from 'react'
-import { requestPlagiarismReport } from './api.js'
+import { requestCheckedCopy, requestPlagiarismReport } from './api.js'
 
 const MIN_PLAGIARISM_CHARS = 300
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
 
 const STATUS_META = {
   answered: { label: 'Answered', className: 'status-answered' },
@@ -13,6 +24,11 @@ const VERDICT_META = {
   partially_correct: { label: 'Partial', className: 'verdict-partial' },
   incorrect: { label: 'Incorrect', className: 'verdict-incorrect' },
   unanswered: { label: 'Unanswered', className: 'verdict-unanswered' },
+  ungraded: { label: 'Not graded', className: 'verdict-unanswered' },
+}
+
+function isLowConfidence(question) {
+  return question.grade?.confidence === 'low'
 }
 
 function isMcq(question) {
@@ -30,7 +46,7 @@ function McqOptions({ question }) {
   const options = question.options ?? []
   if (!options.length) return null
   const selected = normalizeLetter(question.selectedOption)
-  const correct = normalizeLetter(question.grade?.correctOption)
+  const correct = normalizeLetter(question.grade?.correctAnswer)
 
   return (
     <ul className="mcq-options">
@@ -57,10 +73,17 @@ function QuestionListItem({ question, isActive, onClick }) {
   const verdict = question.grade ? VERDICT_META[question.grade.verdict] : null
   const maxMarks = question.grade?.effectiveMaxMarks ?? question.maxMarks
 
+  const lowConfidence = isLowConfidence(question)
+
   return (
-    <button type="button" className={`question-item${isActive ? ' active' : ''}`} onClick={onClick}>
+    <button
+      type="button"
+      className={`question-item${isActive ? ' active' : ''}${lowConfidence ? ' needs-review' : ''}`}
+      onClick={onClick}
+    >
       <div className="question-item-top">
         <span className="question-number">Q{question.displayNumber}</span>
+        {lowConfidence && <span className="review-chip">Review</span>}
         <span className={`status-pill ${status.className}`}>{status.label}</span>
       </div>
       <p className="question-text">{question.text}</p>
@@ -179,6 +202,15 @@ function ReviewPanel({ question }) {
         )}
       </div>
 
+      {isLowConfidence(question) && (
+        <div className="review-section review-flag">
+          <h4 className="review-section-title">Flagged for review</h4>
+          <p className="answer-feedback">
+            {question.grade.confidenceReason || 'The AI was not confident about this one — please check it.'}
+          </p>
+        </div>
+      )}
+
       {question.grade?.feedback && (
         <div className="review-section">
           <h4 className="review-section-title">AI Feedback</h4>
@@ -216,7 +248,7 @@ function formatChoice(question, letter) {
 
 function McqReview({ question }) {
   const student = formatChoice(question, question.selectedOption)
-  const correct = formatChoice(question, question.grade?.correctOption)
+  const correct = formatChoice(question, question.grade?.correctAnswer)
 
   return (
     <>
@@ -244,6 +276,8 @@ function McqReview({ question }) {
 
 export default function MappingView({ result, onReset }) {
   const [selectedQuestionId, setSelectedQuestionId] = useState(result.questions[0]?.id ?? null)
+  const [copyStatus, setCopyStatus] = useState('idle') // 'idle' | 'loading' | 'error'
+  const [copyError, setCopyError] = useState(null)
   const [reportStatus, setReportStatus] = useState('idle') // 'idle' | 'loading' | 'error'
   const [reportError, setReportError] = useState(null)
 
@@ -252,6 +286,16 @@ export default function MappingView({ result, onReset }) {
   const activeRegions = selectedQuestion?.regions ?? []
 
   const answeredCount = result.questions.filter((q) => q.status === 'answered').length
+  const hasGrading = result.questions.some((q) => q.grade)
+  const reviewCount = result.questions.filter(isLowConfidence).length
+
+  // Low-confidence questions first (stable within each group by original order).
+  const orderedQuestions = useMemo(() => {
+    return result.questions
+      .map((q, i) => ({ q, i }))
+      .sort((a, b) => (isLowConfidence(b.q) ? 1 : 0) - (isLowConfidence(a.q) ? 1 : 0) || a.i - b.i)
+      .map(({ q }) => q)
+  }, [result.questions])
 
   const questionPaperText = result.questionPaperText ?? ''
   const canCheckPlagiarism = questionPaperText.trim().length >= MIN_PLAGIARISM_CHARS
@@ -260,19 +304,25 @@ export default function MappingView({ result, onReset }) {
     setSelectedQuestionId(id)
   }
 
+  async function handleDownloadCheckedCopy() {
+    setCopyStatus('loading')
+    setCopyError(null)
+    try {
+      const blob = await requestCheckedCopy(result)
+      downloadBlob(blob, 'checked-copy.pdf')
+      setCopyStatus('idle')
+    } catch (err) {
+      setCopyError(err.message)
+      setCopyStatus('error')
+    }
+  }
+
   async function handlePlagiarismCheck() {
     setReportStatus('loading')
     setReportError(null)
     try {
       const blob = await requestPlagiarismReport(questionPaperText)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'ai-content-detection-report.pdf'
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
+      downloadBlob(blob, 'ai-content-detection-report.pdf')
       setReportStatus('idle')
     } catch (err) {
       setReportError(err.message)
@@ -290,6 +340,20 @@ export default function MappingView({ result, onReset }) {
           </p>
         </div>
         <div className="mapping-header-actions">
+          <div className="checked-copy-action">
+            <button
+              type="button"
+              className="checked-copy-btn"
+              onClick={handleDownloadCheckedCopy}
+              disabled={!hasGrading || copyStatus === 'loading'}
+            >
+              {copyStatus === 'loading' ? 'Preparing…' : 'Download Checked Copy'}
+            </button>
+            {!hasGrading && <span className="checked-copy-hint">Grading unavailable</span>}
+            {copyStatus === 'error' && copyError && (
+              <span className="checked-copy-error">{copyError}</span>
+            )}
+          </div>
           <div className="plagiarism-action">
             <button
               type="button"
@@ -312,6 +376,13 @@ export default function MappingView({ result, onReset }) {
         </div>
       </div>
 
+      {reviewCount > 0 && (
+        <div className="review-banner">
+          {reviewCount} question{reviewCount > 1 ? 's' : ''} flagged for your review — check the ones marked{' '}
+          <span className="review-chip">Review</span> below.
+        </div>
+      )}
+
       {result.overallFeedback && (
         <div className="overall-feedback">
           <strong>Overall Feedback:</strong> {result.overallFeedback}
@@ -320,7 +391,7 @@ export default function MappingView({ result, onReset }) {
 
       <div className="mapping-grid">
         <div className="question-panel">
-          {result.questions.map((q) => (
+          {orderedQuestions.map((q) => (
             <QuestionListItem
               key={q.id}
               question={q}
