@@ -141,8 +141,8 @@ function printRow(r) {
 }
 
 async function main() {
-  if (!process.env.OPENROUTER_API_KEY) {
-    console.error('OPENROUTER_API_KEY is not set — add it to Backend/.env')
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('OPENAI_API_KEY is not set — add it to Backend/.env')
     process.exit(2)
   }
   if (!fs.existsSync(FIXTURES_DIR)) {

@@ -120,16 +120,19 @@ async function gradeOne(question, mapping, answerPages) {
 
   let grade = await runOnce()
 
-  // Self-consistency for open-ended answered questions.
-  if (!isObjective && mapping.status === 'answered') {
+  // Cost control: only re-grade when the FIRST pass itself flagged uncertainty
+  // (its own low-confidence signal), rather than doubling every open-ended call.
+  // This catches genuinely borderline cases without paying 2x on every question.
+  if (!isObjective && mapping.status === 'answered' && grade.confidence === 'low') {
     const second = await runOnce()
-    if (Math.abs((grade.score ?? 0) - (second.score ?? 0)) > SELF_CONSISTENCY_TOLERANCE) {
-      const lower = (second.score ?? 0) < (grade.score ?? 0) ? second : grade
-      grade = {
-        ...lower,
-        confidence: 'low',
-        confidenceReason: `Scores varied between grading runs (${grade.score} vs ${second.score}); took the lower.`,
-      }
+    const lower = (second.score ?? 0) < (grade.score ?? 0) ? second : grade
+    grade = {
+      ...lower,
+      confidence: Math.abs((grade.score ?? 0) - (second.score ?? 0)) > SELF_CONSISTENCY_TOLERANCE ? 'low' : 'high',
+      confidenceReason:
+        Math.abs((grade.score ?? 0) - (second.score ?? 0)) > SELF_CONSISTENCY_TOLERANCE
+          ? `Scores varied between grading runs (${grade.score} vs ${second.score}); took the lower.`
+          : null,
     }
   }
 

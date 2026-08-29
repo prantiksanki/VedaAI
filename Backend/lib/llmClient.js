@@ -4,19 +4,11 @@ let client = null
 
 export function getClient() {
   if (!client) {
-    if (!process.env.OPENROUTER_API_KEY) {
-      throw new Error(
-        'OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your OpenRouter key.',
-      )
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY is not set. Copy .env.example to .env and add your key.')
     }
     client = new OpenAI({
-      baseURL: process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1',
-      apiKey: process.env.OPENROUTER_API_KEY,
-      defaultHeaders: {
-        'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'https://vedaai.local',
-        'X-Title': 'VedaAI',
-      },
-      // The three pipeline stages fan out many calls; give each generous headroom.
+      apiKey: process.env.OPENAI_API_KEY,
       timeout: 120_000,
       maxRetries: 0, // we do our own retry with backoff below
     })
@@ -24,7 +16,12 @@ export function getClient() {
   return client
 }
 
-export const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5'
+// gpt-4o reads handwriting and returns bounding boxes far more reliably than mini -
+// this is the accuracy-critical path (question extraction, answer reading, grading).
+export const VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4o'
+// Reserved for cheap, low-stakes sub-calls where mini's accuracy is good enough
+// (currently unused, kept for future cost-tuning).
+export const FAST_MODEL = process.env.OPENAI_FAST_MODEL || 'gpt-4o-mini'
 
 const MAX_ATTEMPTS = 3
 
@@ -33,12 +30,16 @@ function sleep(ms) {
 }
 
 /**
- * Build a user-message content array from text and images.
+ * Build an OpenAI-style user content array from text and images.
+ * Images are sent at "high" detail - required for reading handwriting reliably.
  * @param {string} text
  * @param {string[]} [imageDataUrls] - "data:image/jpeg;base64,..." strings
  */
 export function userContent(text, imageDataUrls = []) {
-  const parts = imageDataUrls.map((url) => ({ type: 'image_url', image_url: { url } }))
+  const parts = imageDataUrls.map((url) => ({
+    type: 'image_url',
+    image_url: { url, detail: 'high' },
+  }))
   parts.push({ type: 'text', text })
   return parts
 }
@@ -48,22 +49,31 @@ export function userContent(text, imageDataUrls = []) {
  *
  * @param {{
  *   system: string,
- *   content: Array|string,   // OpenAI-style user content (text + image_url parts)
+ *   content: Array|string,
  *   schemaName: string,
- *   schema: object,          // JSON schema; must be strict-mode compatible
- *   stage?: string,          // for error messages
+ *   schema: object,
+ *   stage?: string,
  *   maxTokens?: number,
+ *   model?: string,
  * }} args
  * @returns {Promise<object>} parsed JSON matching `schema`
  */
-export async function callStructured({ system, content, schemaName, schema, stage = 'llm', maxTokens = 16000 }) {
+export async function callStructured({
+  system,
+  content,
+  schemaName,
+  schema,
+  stage = 'llm',
+  maxTokens = 16000,
+  model = VISION_MODEL,
+}) {
   const openai = getClient()
   let lastErr
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const response = await openai.chat.completions.create({
-        model: MODEL,
+        model,
         temperature: 0,
         max_tokens: maxTokens,
         messages: [

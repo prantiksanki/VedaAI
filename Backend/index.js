@@ -5,6 +5,7 @@ import multer from 'multer'
 import { v4 as uuid } from 'uuid'
 
 import { rasterize } from './lib/rasterize.js'
+import { detectLines } from './lib/lineGeometry.js'
 import { extractQuestions } from './lib/extractQuestions.js'
 import { extractAndMapAnswers } from './lib/extractAnswers.js'
 import { gradeAnswers } from './lib/gradeAnswers.js'
@@ -103,7 +104,7 @@ async function stage(jobId, step, fn) {
 }
 
 async function processJob(jobId, questionPaperFile, answerSheetFile) {
-  const [questionPaperPages, answerPages] = await stage(jobId, 'rasterizing', () =>
+  const [questionPaperPages, answerPages, answerLineGeometry] = await stage(jobId, 'rasterizing', () =>
     Promise.all([
       rasterize({
         buffer: questionPaperFile.buffer,
@@ -115,13 +116,24 @@ async function processJob(jobId, questionPaperFile, answerSheetFile) {
         mimetype: answerSheetFile.mimetype,
         originalname: answerSheetFile.originalname,
       }),
+      // Geometry only (no text reading) - gives pixel-precise line boxes for the
+      // vision model to point at, instead of guessing coordinates. Non-fatal if the
+      // service is down: extraction/grading still work, just without highlight boxes.
+      detectLines({
+        buffer: answerSheetFile.buffer,
+        mimetype: answerSheetFile.mimetype,
+        originalname: answerSheetFile.originalname,
+      }).catch((err) => {
+        console.error(`Job ${jobId} line-geometry unavailable (non-fatal): ${err.message}`)
+        return null
+      }),
     ]),
   )
 
   const questions = await stage(jobId, 'extracting_questions', () => extractQuestions(questionPaperPages))
 
   const { mappings } = await stage(jobId, 'mapping_answers', () =>
-    extractAndMapAnswers(questions, answerPages),
+    extractAndMapAnswers(questions, answerPages, answerLineGeometry),
   )
 
   // Grading is best-effort: if it fails, the teacher still gets extraction + mapping.

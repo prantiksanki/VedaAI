@@ -1,5 +1,6 @@
 import { callStructured, userContent } from './llmClient.js'
 import { OBJECTIVE_QUESTION_TYPES } from './extractQuestions.js'
+import { annotateLines } from './annotateLines.js'
 
 // How many answer-sheet page images per vision call. Small so each answer's location
 // stays precise and the model isn't overwhelmed.
@@ -26,20 +27,17 @@ const ANSWERS_SCHEMA = {
             type: ['string', 'null'],
             description: 'For MCQ/assertion_reason: the chosen option LETTER. For true_false: "true" or "false". For fill_blank: the text the student wrote in the blank. null if not applicable / nothing chosen.',
           },
-          regions: {
+          lineRefs: {
             type: 'array',
-            description: 'Tight bounding box(es) around this student\'s answer, one per page it appears on. Pixel coordinates in the given image.',
+            description: 'Which numbered line markers (the red boxed numbers printed on the image) belong to this answer\'s OWN written content - never the question-label line. One entry per page the answer appears on.',
             items: {
               type: 'object',
               additionalProperties: false,
               properties: {
-                page: { type: 'number', description: 'page number as labelled for the image this box is in' },
-                x: { type: 'number', description: 'left edge, pixels' },
-                y: { type: 'number', description: 'top edge, pixels' },
-                width: { type: 'number', description: 'pixels' },
-                height: { type: 'number', description: 'pixels' },
+                page: { type: 'number', description: 'page number as labelled for the image this line is in' },
+                lineIndices: { type: 'array', items: { type: 'number' }, description: 'the line-marker numbers on that page that are this answer' },
               },
-              required: ['page', 'x', 'y', 'width', 'height'],
+              required: ['page', 'lineIndices'],
             },
           },
           continuesBeyondThesePages: {
@@ -47,7 +45,7 @@ const ANSWERS_SCHEMA = {
             description: 'true if this answer clearly runs onto a page not shown in this call',
           },
         },
-        required: ['questionId', 'answered', 'transcription', 'selectedOption', 'regions', 'continuesBeyondThesePages'],
+        required: ['questionId', 'answered', 'transcription', 'selectedOption', 'lineRefs', 'continuesBeyondThesePages'],
       },
     },
   },
@@ -55,6 +53,8 @@ const ANSWERS_SCHEMA = {
 }
 
 const SYSTEM_PROMPT = `You are matching a student's handwritten answer sheet to a known list of exam questions. You are shown page images of the answer sheet and the full question list.
+
+Every line of text on each page image has a small numbered red marker printed just to its left (0, 1, 2, ...), with a thin red outline around the exact line it labels. Use these numbers to report WHERE an answer is - never guess coordinates.
 
 For every question that has ANY student work visible in these page images, output one "answers" entry:
 - "questionId": copy the id exactly from the question list. Match by the student's written question label (which appears in many forms — "Q2", "2)", "Ans 2", "2.a", "Q-2(a)") AND by the content matching the question. If a label is ambiguous, use the content.
@@ -65,20 +65,24 @@ For every question that has ANY student work visible in these page images, outpu
     · true_false → "true" or "false".
     · fill_blank → the exact text the student wrote in the blank.
     · otherwise → null.
-- "regions": draw a TIGHT bounding box around the student's whole answer to this question, in PIXELS of the image. One box per page the answer appears on. These become highlights a teacher sees — be precise, don't include neighbouring answers or the question label line if it's far from the work.
+- "lineRefs": for each page this answer appears on, list the numbered line-marker(s) that are this answer's OWN content — e.g. if the marker-3 line and marker-4 line are the two lines the student wrote for this answer, report lineIndices [3, 4]. Include EVERY consecutive line that is genuinely part of this one answer (working spanning several lines). Do NOT include the line carrying the question's own label/number (e.g. the "Q11." line) unless the student's answer starts on that same line right after the label — in that case include it too. Do NOT include neighbouring questions' lines.
 - "continuesBeyondThesePages": true if the answer obviously runs onto a page you weren't shown.
 
 Only report what is actually visible here. Do not invent answers for questions with no work on these pages — just omit them.`
 
 async function readChunk(questionList, pages) {
-  const imageDataUrls = pages.map((p) => p.dataUrl)
-  const labelled = pages.map((p, i) => `Image ${i + 1} is answer-sheet page ${p.page} (${p.width}x${p.height} px).`).join('\n')
+  const annotated = await Promise.all(
+    pages.map((p) => annotateLines(p.dataUrl, { width: p.width, height: p.height }, p.lines)),
+  )
+  const labelled = pages
+    .map((p, i) => `Image ${i + 1} is answer-sheet page ${p.page}, with ${p.lines.length} numbered line markers (0-${p.lines.length - 1}).`)
+    .join('\n')
 
   const result = await callStructured({
     system: SYSTEM_PROMPT,
     content: userContent(
       `Question list (JSON):\n${JSON.stringify(questionList, null, 2)}\n\n${labelled}\n\nFind every student answer visible on these pages.`,
-      imageDataUrls,
+      annotated,
     ),
     schemaName: 'answer_reading',
     schema: ANSWERS_SCHEMA,
@@ -94,25 +98,32 @@ function chunkPages(pages, size) {
 }
 
 /**
- * Normalize a pixel box against its page's dimensions -> 0..1 fractions, clamped.
+ * Resolves lineRefs (page + line index) against the detected line geometry into
+ * normalized 0..1 regions, merging adjacent same-answer lines into contiguous boxes.
  */
-function normalizeRegion(region, pageByNumber) {
-  const page = pageByNumber.get(region.page)
-  if (!page || !page.width || !page.height) return null
-  const x = Math.max(0, Math.min(1, region.x / page.width))
-  const y = Math.max(0, Math.min(1, region.y / page.height))
-  const width = Math.max(0, Math.min(1 - x, region.width / page.width))
-  const height = Math.max(0, Math.min(1 - y, region.height / page.height))
-  if (width <= 0 || height <= 0) return null
-  return { page: region.page, x, y, width, height }
+function resolveRegions(lineRefs, pagesByNumber) {
+  const regions = []
+  for (const ref of lineRefs ?? []) {
+    const page = pagesByNumber.get(ref.page)
+    if (!page) continue
+    for (const idx of ref.lineIndices ?? []) {
+      const line = page.lines[idx]
+      if (!line) continue
+      regions.push({ page: ref.page, x: line.x, y: line.y, width: line.width, height: line.height })
+    }
+  }
+  return regions
 }
 
 /**
  * @param {Array<object>} questions - from extractQuestions (have stable `id`)
  * @param {Array<{ page:number, width:number, height:number, dataUrl:string }>} answerPages
+ * @param {Array<{ page:number, width:number, height:number, lines:Array }>|null} lineGeometry
+ *   - from lib/lineGeometry.js `detectLines()`, or null if that service was unreachable
+ *     (extraction/grading still work then, just without highlight boxes).
  * @returns {Promise<{ mappings: Array<{ questionId, status, answerText, selectedOption, regions }> }>}
  */
-export async function extractAndMapAnswers(questions, answerPages) {
+export async function extractAndMapAnswers(questions, answerPages, lineGeometry = null) {
   const questionList = questions.map((q) => ({
     id: q.id,
     displayNumber: q.displayNumber,
@@ -121,9 +132,15 @@ export async function extractAndMapAnswers(questions, answerPages) {
     options: q.options ?? [],
   }))
   const questionById = new Map(questions.map((q) => [q.id, q]))
-  const pageByNumber = new Map(answerPages.map((p) => [p.page, p]))
 
-  const groups = chunkPages(answerPages, PAGES_PER_CALL)
+  const linesByPage = new Map()
+  if (lineGeometry) {
+    for (const gp of lineGeometry) linesByPage.set(gp.page, gp.lines)
+  }
+  const pagesWithLines = answerPages.map((p) => ({ ...p, lines: linesByPage.get(p.page) ?? [] }))
+  const pagesByNumber = new Map(pagesWithLines.map((p) => [p.page, p]))
+
+  const groups = chunkPages(pagesWithLines, PAGES_PER_CALL)
   const perGroup = await Promise.all(groups.map((g) => readChunk(questionList, g)))
 
   // Reconcile by questionId across page-calls.
@@ -131,9 +148,7 @@ export async function extractAndMapAnswers(questions, answerPages) {
   for (const answers of perGroup) {
     for (const a of answers) {
       if (!questionById.has(a.questionId)) continue // ignore hallucinated ids
-      const regions = (a.regions ?? [])
-        .map((r) => normalizeRegion(r, pageByNumber))
-        .filter(Boolean)
+      const regions = resolveRegions(a.lineRefs, pagesByNumber)
       const existing = byId.get(a.questionId)
       if (!existing) {
         byId.set(a.questionId, {

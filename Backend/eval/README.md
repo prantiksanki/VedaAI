@@ -11,7 +11,7 @@ npm run eval                 # all fixtures
 npm run eval -- maths-10cbse  # one fixture (folder name)
 ```
 
-Needs `OPENROUTER_API_KEY` in `Backend/.env`. Every run costs real API money
+Needs `OPENAI_API_KEY` in `Backend/.env`. Every run costs real API money
 (roughly one exam's worth of vision calls per fixture).
 
 ## Add a fixture
