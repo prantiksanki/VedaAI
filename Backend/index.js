@@ -30,6 +30,7 @@ const upload = multer({
 })
 
 app.get('/health', (req, res) => res.json({ ok: true }))
+app.head('/health', (req, res) => res.sendStatus(200))
 
 function handleUpload(req, res, next) {
   upload.fields([
