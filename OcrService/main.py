@@ -133,6 +133,7 @@ def load_page_images(filename: str, content_type: str, data: bytes) -> list[Imag
 
 
 @app.get("/health")
+@app.head("/health")
 def health():
     return {"ok": True}
 
