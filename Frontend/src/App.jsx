@@ -132,9 +132,10 @@ function App() {
   const [activeNav, setActiveNav] = useState('exams')
   const [questionPaper, setQuestionPaper] = useState(null)
   const [answerSheet, setAnswerSheet] = useState(null)
-  const [stage, setStage] = useState('upload') // 'upload' | 'processing' | 'results'
+  const isMock = new URLSearchParams(window.location.search).has('mock')
+  const [stage, setStage] = useState(isMock ? 'results' : 'upload') // 'upload' | 'processing' | 'results'
   const [processingStep, setProcessingStep] = useState(null)
-  const [result, setResult] = useState(null)
+  const [result, setResult] = useState(isMock ? window.__MOCK_RESULT__ : null)
   const [error, setError] = useState(null)
 
   const canStartMapping = Boolean(questionPaper && answerSheet)
@@ -300,7 +301,6 @@ function App() {
                         Question Paper &amp; Answer Sheets
                       </span>
                     </h1>
-                    <span className="assignee-tag">Vishal Lodhi</span>
                   </div>
                   <p className="page-subheading">Upload both files to get started</p>
 
@@ -315,13 +315,13 @@ function App() {
                   <div className="upload-grid">
                     <UploadCard
                       highlight="Question Paper"
-                      hint="Max 500MB"
+                      hint="Max 10MB"
                       file={questionPaper}
                       onFileSelect={setQuestionPaper}
                     />
                     <UploadCard
                       highlight="Answer Sheet"
-                      hint="Max 500MB"
+                      hint="Max 10MB"
                       file={answerSheet}
                       onFileSelect={setAnswerSheet}
                     />

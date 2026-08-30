@@ -13,6 +13,23 @@ export async function uploadFiles(questionPaper, answerSheet) {
   return res.json() // { jobId }
 }
 
+/**
+ * Sends the question-paper text to the backend, which runs Winston AI content
+ * detection and returns a PDF report as a Blob.
+ */
+export async function requestPlagiarismReport(text) {
+  const res = await fetch(`${API_BASE}/api/plagiarism-report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `Report failed (${res.status})`)
+  }
+  return res.blob()
+}
+
 export async function getJob(jobId) {
   const res = await fetch(`${API_BASE}/api/jobs/${jobId}`)
   if (!res.ok) {
@@ -22,12 +39,29 @@ export async function getJob(jobId) {
   return res.json()
 }
 
+/**
+ * Sends the graded result to the backend and gets back the "checked copy"
+ * PDF (grading summary + annotated answer-sheet pages) as a Blob.
+ */
+export async function requestCheckedCopy(result) {
+  const res = await fetch(`${API_BASE}/api/checked-copy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ result }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `Checked copy failed (${res.status})`)
+  }
+  return res.blob()
+}
+
 export const PROCESSING_STEPS = [
   { key: 'uploading', label: 'Uploading files' },
-  { key: 'running_ocr', label: 'Reading pages with OCR' },
-  { key: 'extracting_questions', label: 'Extracting questions from paper' },
-  { key: 'mapping_answers', label: 'Reading handwriting & mapping answers' },
-  { key: 'grading', label: 'Grading answers' },
+  { key: 'rasterizing', label: 'Preparing page images' },
+  { key: 'extracting_questions', label: 'Reading the question paper' },
+  { key: 'mapping_answers', label: 'Reading the answer sheet' },
+  { key: 'grading', label: 'Marking answers' },
   { key: 'complete', label: 'Done' },
 ]
 
