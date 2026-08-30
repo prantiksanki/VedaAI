@@ -313,6 +313,12 @@ function writeAnnotation(doc, question, left, width) {
   const feedback = question.grade?.feedback || 'No feedback for this question.'
   doc.font('Helvetica').fontSize(9).fillColor(MUTED).text(feedback, left, doc.y, { width })
 
+  if (question.grade?.teacherComment) {
+    doc.moveDown(0.2)
+    doc.font('Helvetica-Bold').fontSize(9).fillColor(INK).text("Teacher's Comment: ", left, doc.y, { continued: true, width })
+    doc.font('Helvetica').fillColor(INK).text(question.grade.teacherComment)
+  }
+
   if (question.questionType === 'mcq' || question.questionType === 'assertion_reason') {
     const chosen = question.selectedOption ?? '-'
     const correct = question.grade?.correctOption ?? '-'
