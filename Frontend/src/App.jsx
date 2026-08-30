@@ -301,7 +301,6 @@ function App() {
                         Question Paper &amp; Answer Sheets
                       </span>
                     </h1>
-                    <span className="assignee-tag">Vishal Lodhi</span>
                   </div>
                   <p className="page-subheading">Upload both files to get started</p>
 
@@ -316,13 +315,13 @@ function App() {
                   <div className="upload-grid">
                     <UploadCard
                       highlight="Question Paper"
-                      hint="Max 500MB"
+                      hint="Max 10MB"
                       file={questionPaper}
                       onFileSelect={setQuestionPaper}
                     />
                     <UploadCard
                       highlight="Answer Sheet"
-                      hint="Max 500MB"
+                      hint="Max 10MB"
                       file={answerSheet}
                       onFileSelect={setAnswerSheet}
                     />
