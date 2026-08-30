@@ -1,9 +1,8 @@
 import base64
 import io
 
-import numpy as np
 import pypdfium2 as pdfium
-from doctr.models import detection_predictor
+import pytesseract
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image
 
@@ -12,21 +11,28 @@ app = FastAPI(title="VedaAI OCR Service (geometry only)")
 MAX_DIMENSION = 2000  # cap longest edge; keeps inference fast and payloads small
 PDF_RENDER_SCALE = 2.0
 
-_detector = None
 
-
-def get_detector():
+def detect_word_boxes(pil_img: Image.Image) -> list[dict]:
     """
-    Detection-only (no recognition/text-reading). VedaAI's grading pipeline reads and
-    transcribes handwriting with a vision LLM, which is far more accurate than any
-    OCR text model - this service now exists ONLY to return precise word/line
-    bounding boxes for the answer-highlight overlay, never to read text. db_resnet50
-    is docTR's strongest detector, good on both printed and handwritten strokes.
+    Detection-only (no recognition/text-reading is trusted downstream). VedaAI's
+    grading pipeline reads and transcribes handwriting with a vision LLM, which is
+    far more accurate than any OCR text model - this service exists ONLY to return
+    precise word/line bounding boxes for the answer-highlight overlay. Tesseract's
+    own text output is discarded; only its word bounding boxes are used, which is
+    lightweight enough to run without a GPU/PyTorch runtime.
     """
-    global _detector
-    if _detector is None:
-        _detector = detection_predictor(arch="db_resnet50", pretrained=True, assume_straight_pages=True)
-    return _detector
+    data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
+    words = []
+    for i in range(len(data["text"])):
+        if int(data["conf"][i]) < 0:
+            continue
+        if not data["text"][i].strip():
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        if w <= 0 or h <= 0:
+            continue
+        words.append({"x": float(x), "y": float(y), "width": float(w), "height": float(h)})
+    return words
 
 
 def _vertical_overlap_ratio(a: dict, b: dict) -> float:
@@ -116,13 +122,6 @@ def load_page_images(filename: str, content_type: str, data: bytes) -> list[Imag
     return [image]
 
 
-@app.on_event("startup")
-def preload_models():
-    # Load (and download, on first run) model weights eagerly so the first
-    # real request isn't slowed down by a model download/load.
-    get_detector()
-
-
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -145,17 +144,18 @@ async def detect_lines(file: UploadFile = File(...)):
     if not page_images:
         raise HTTPException(status_code=400, detail="No pages found in file")
 
-    detector = get_detector()
-    arrays = [np.array(img) for img in page_images]
-    detections = detector(arrays)
-
     pages_out = []
-    for page_index, (det, pil_img) in enumerate(zip(detections, page_images)):
+    for page_index, pil_img in enumerate(page_images):
         width, height = pil_img.size
+        raw_words = detect_word_boxes(pil_img)
         words = [
-            {"x": round(float(x0), 4), "y": round(float(y0), 4), "width": round(float(x1 - x0), 4), "height": round(float(y1 - y0), 4)}
-            for x0, y0, x1, y1, _score in det["words"]
-            if x1 > x0 and y1 > y0
+            {
+                "x": round(w["x"] / width, 4),
+                "y": round(w["y"] / height, 4),
+                "width": round(w["width"] / width, 4),
+                "height": round(w["height"] / height, 4),
+            }
+            for w in raw_words
         ]
         lines_out = merge_word_boxes_into_lines(words)
         # Reading order top-to-bottom, then left-to-right within a row. Assumes
