@@ -1,19 +1,22 @@
 # OCR Service (line geometry only)
 
-A small FastAPI sidecar that runs [docTR](https://github.com/mindee/doctr)'s text **detection** model (no recognition/reading) to find precise text-line bounding boxes on a scanned answer sheet.
+A small FastAPI sidecar that runs [Tesseract](https://github.com/tesseract-ocr/tesseract) in detection mode (its recognized text is discarded, only word bounding boxes are used) to find precise text-line bounding boxes on a scanned answer sheet.
 
 Reading and transcribing the actual handwriting is done by a vision LLM (GPT-4o) in the Node backend directly from the page images — that is far more accurate than any OCR text-recognition model on messy handwriting, math notation, or non-Latin scripts. This service exists only to give the LLM **pixel-precise locations**: the backend overlays the detected line boxes as numbered markers on the image (`Backend/lib/annotateLines.js`), and the LLM reports which numbered lines belong to which answer instead of guessing coordinates — a discrete pick, not coordinate regression, which is much more reliable.
 
-Uses `db_resnet50`, docTR's strongest detector, which handles both printed and handwritten strokes well since it only needs to find *where* text is, not read it.
+Tesseract was chosen over a PyTorch-based detector (docTR) specifically because it has no ML runtime overhead — it fits comfortably in small deploy environments (e.g. Render's free tier), which matters because this service only needs to find *where* text is, not read it, so a heavier/more accurate text-recognition model buys nothing here.
 
 ## Setup
 
-Requires Python 3.10 or 3.11 (docTR's PyTorch backend wheels aren't published for 3.13 yet on all platforms).
+Requires the `tesseract-ocr` system binary in addition to the Python packages in `requirements.txt`.
 
 ```powershell
-py -3.10 -m venv venv
-.\venv\Scripts\pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# Windows: install Tesseract (e.g. https://github.com/UB-Mannheim/tesseract/wiki), then:
+py -3.11 -m venv venv
+.\venv\Scripts\pip install -r requirements.txt
 ```
+
+On Linux/Docker: `apt-get install tesseract-ocr` (see `Dockerfile`).
 
 ## Run
 
@@ -21,7 +24,9 @@ py -3.10 -m venv venv
 .\venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-First startup will be slow (a minute or so) while docTR downloads the detector weights. Subsequent requests are fast — detection-only is quicker than the old full OCR (detection + recognition) pipeline.
+### Deploying (Render)
+
+This service ships a `Dockerfile` so Render can install the `tesseract-ocr` system package, which isn't available on Render's native Python runtime. Set the service's Runtime to **Docker**.
 
 This service is **optional**: if it's not running, the backend still works — question extraction, answer reading, and grading all happen via the vision LLM regardless. You just won't get answer-highlight boxes on the results screen.
 
