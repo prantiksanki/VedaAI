@@ -12,6 +12,9 @@ MAX_DIMENSION = 2000  # cap longest edge; keeps inference fast and payloads smal
 PDF_RENDER_SCALE = 2.0
 
 
+MIN_CONFIDENCE = 40  # Tesseract's 0-100 scale; below this is mostly noise/specks, not real text
+
+
 def detect_word_boxes(pil_img: Image.Image) -> list[dict]:
     """
     Detection-only (no recognition/text-reading is trusted downstream). VedaAI's
@@ -21,15 +24,22 @@ def detect_word_boxes(pil_img: Image.Image) -> list[dict]:
     own text output is discarded; only its word bounding boxes are used, which is
     lightweight enough to run without a GPU/PyTorch runtime.
     """
+    img_w, img_h = pil_img.size
     data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
     words = []
     for i in range(len(data["text"])):
-        if int(data["conf"][i]) < 0:
+        if int(data["conf"][i]) < MIN_CONFIDENCE:
             continue
         if not data["text"][i].strip():
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         if w <= 0 or h <= 0:
+            continue
+        # Reject boxes that fall outside the page (or nearly cover it) - stray
+        # detections on noise/artifacts, never a real word.
+        if x < 0 or y < 0 or x + w > img_w or y + h > img_h:
+            continue
+        if w > img_w * 0.9 or h > img_h * 0.9:
             continue
         words.append({"x": float(x), "y": float(y), "width": float(w), "height": float(h)})
     return words
